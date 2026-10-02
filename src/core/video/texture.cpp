@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 #include "core/memory.h"
+#include "core/state.h"
 #include "core/video/video_internal.h"
 
 namespace Video {
@@ -266,6 +267,8 @@ void SampleMip(u32 texmap, s32 s, s32 t, s32 mip, bool linear, u8 out[4]) {
 }
 
 }  // namespace
+
+void TextureDoState(StateBuffer& s) { s.DoBytes(s_tmem, TMEM_SIZE); }
 
 void TextureReset() {
   if (!s_tmem) s_tmem = (u8*)calloc(1, TMEM_SIZE);

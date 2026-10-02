@@ -4,6 +4,7 @@
 #include "core/disc/disc_reader.h"
 #include "core/hw/hw.h"
 #include "core/memory.h"
+#include "core/state.h"
 
 namespace DI {
 
@@ -82,6 +83,19 @@ void Reset() {
   s_sr = s_cmd[0] = s_cmd[1] = s_cmd[2] = s_mar = s_length = s_cr = s_immbuf = s_cfg = s_error = 0;
   s_cvr = s_disc ? 0 : 1;  // bit 0: lid open
   UpdateInterrupt();
+}
+
+void DoState(StateBuffer& s) {
+  s.Marker("DI");
+  s.Do(s_sr);
+  s.Do(s_cvr);
+  s.Do(s_cmd);
+  s.Do(s_mar);
+  s.Do(s_length);
+  s.Do(s_cr);
+  s.Do(s_immbuf);
+  s.Do(s_cfg);
+  s.Do(s_error);
 }
 
 bool OpenDisc(const std::string& path) {

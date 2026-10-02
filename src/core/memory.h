@@ -16,6 +16,7 @@ constexpr u32 WGP_ADDR = 0x0C008000;   // write-gather pipe (GX FIFO)
 extern u8* g_mem1;
 extern u8 g_l2[L2_SIZE];
 
+void DoState(StateBuffer& s);
 bool Init();
 void Shutdown();
 void Clear();

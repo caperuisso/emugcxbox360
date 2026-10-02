@@ -16,6 +16,8 @@ class MemoryCard {
   // Opens (or creates and formats) the card image. flash_id: 12 bytes from SRAM.
   bool Open(const std::string& path, const u8* flash_id);
   void Close();
+  // Protocol state only: the card contents live in the image file.
+  void DoState(StateBuffer& s);
 
   void Select(bool selected);
   u8 TransferByte(u8 in);

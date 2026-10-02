@@ -6,6 +6,7 @@
 #include <cstdlib>
 
 #include "core/memory.h"
+#include "core/state.h"
 #include "core/video/video_internal.h"
 
 namespace Video {
@@ -290,6 +291,11 @@ void Clear(int sx, int sy, int w, int h) {
 }
 
 }  // namespace
+
+void EFBDoState(StateBuffer& s) {
+  s.DoBytes(s_color, EFB_WIDTH * EFB_HEIGHT * 4);
+  s.DoBytes(s_depth, EFB_WIDTH * EFB_HEIGHT * 4);
+}
 
 void EFBReset() {
   if (!s_color) s_color = (u32*)calloc(EFB_WIDTH * EFB_HEIGHT, 4);

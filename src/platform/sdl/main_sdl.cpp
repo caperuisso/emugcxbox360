@@ -78,6 +78,8 @@ std::vector<ScriptedPress> ParseScript(const std::string& spec) {
 class SDLHost : public Host {
  public:
   std::vector<ScriptedPress> script;
+  std::string state_path;
+  bool request_save = false, request_load = false;
   long current_frame = 0;
   bool headless = false;
   SDL_Window* window = nullptr;
@@ -267,6 +269,8 @@ class SDLHost : public Host {
     while (SDL_PollEvent(&e)) {
       if (e.type == SDL_QUIT) return false;
       if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_ESCAPE) return false;
+      if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F1) request_save = true;
+      if (e.type == SDL_KEYDOWN && e.key.keysym.sym == SDLK_F3) request_load = true;
       if (e.type == SDL_CONTROLLERDEVICEADDED && !pad) pad = SDL_GameControllerOpen(e.cdevice.which);
     }
     return true;
@@ -302,6 +306,9 @@ void Usage(const char* argv0) {
           "  --stats           print GPU statistics every 60 fields\n"
           "  --input SPEC      scripted pad input, e.g. 1000:start:10,1300:a:5\n"
           "  --wav FILE        record the audio output to a WAV file\n"
+          "  --load-state FILE load a save state right after booting\n"
+          "  --save-state N:FILE  save a state after N fields\n"
+          "  (keys: F1 save state, F3 load state)\n"
           "  --memcard FILE    memory card image for slot A (default ~/.emugcxbox360/memcard_a.raw, 'none' = no card)\n"
           "  --dump-every N    with --dump, also save a frame every N fields (name_FRAME.ppm)\n",
           argv0);
@@ -312,7 +319,8 @@ void Usage(const char* argv0) {
 int main(int argc, char** argv) {
   SDLHost host;
   std::string path, dump;
-  long max_frames = -1, dump_every = 0;
+  long max_frames = -1, dump_every = 0, save_state_at = -1;
+  std::string load_state, save_state_path;
   int scale = 1;
   bool throttle = true, dump_regs = false, stats = false;
   std::vector<u32> osreport_addrs;
@@ -328,6 +336,13 @@ int main(int argc, char** argv) {
     else if (a == "--stats") stats = true;
     else if (a == "--input" && i + 1 < argc) host.script = ParseScript(argv[++i]);
     else if (a == "--memcard" && i + 1 < argc) host.memcard_path = argv[++i];
+    else if (a == "--load-state" && i + 1 < argc) load_state = argv[++i];
+    else if (a == "--save-state" && i + 1 < argc) {
+      std::string spec = argv[++i];
+      size_t c = spec.find(':');
+      save_state_at = atol(spec.substr(0, c).c_str());
+      save_state_path = c == std::string::npos ? "state.st" : spec.substr(c + 1);
+    }
     else if (a == "--wav" && i + 1 < argc) {
       host.wav = fopen(argv[++i], "wb");
       static const u8 placeholder[44] = {};
@@ -351,6 +366,12 @@ int main(int argc, char** argv) {
     return 1;
   }
   for (u32 addr : osreport_addrs) HLE::Patch(addr, HLE::OSReport, "OSReport");
+  if (!load_state.empty() && !System::LoadState(load_state)) {
+    host.Close();
+    return 1;
+  }
+  host.state_path = host.MemcardPath(0).empty() ? std::string("quick.st")
+                                                : host.MemcardPath(0).substr(0, host.MemcardPath(0).rfind('/') + 1) + "quick.st";
 
   using clock = std::chrono::steady_clock;
   auto next = clock::now();
@@ -368,6 +389,10 @@ int main(int argc, char** argv) {
       host.DumpPPM(name.c_str());
     }
     fps_frames++;
+    if (frames == save_state_at) System::SaveState(save_state_path);
+    if (host.request_save) System::SaveState(host.state_path);
+    if (host.request_load) System::LoadState(host.state_path);
+    host.request_save = host.request_load = false;
     if (stats && frames % 60 == 0) {
       const Video::Stats& s = Video::g_stats;
       printf("[stats] field %ld: prims=%u verts=%u tris=%u pixels=%u efb_copies=%u xfb_copies=%u pc=%08x\n", frames,

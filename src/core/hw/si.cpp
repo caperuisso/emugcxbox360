@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Serial Interface: GameCube controller ports (standard pad emulation).
 #include "core/hw/hw.h"
+#include "core/state.h"
 #include "platform/platform.h"
 
 namespace SI {
@@ -109,6 +110,17 @@ void Reset() {
   memset(s_iobuf, 0, sizeof(s_iobuf));
   for (auto& p : s_pads) p = PadState();
   UpdateInterrupt();
+}
+
+void DoState(StateBuffer& s) {
+  s.Marker("SI");
+  s.Do(s_ch);
+  s.Do(s_poll);
+  s.Do(s_comcsr);
+  s.Do(s_status);
+  s.Do(s_exilk);
+  s.Do(s_iobuf);
+  s.Do(s_pads);
 }
 
 void UpdatePolling() {

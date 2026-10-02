@@ -12,6 +12,7 @@
 #include "core/hw/ax_audio.h"
 #include "core/hw/zelda_audio.h"
 #include "core/memory.h"
+#include "core/state.h"
 
 namespace DSPHLE {
 
@@ -111,6 +112,13 @@ class UCode {
     }
   }
   u32 crc() const { return m_crc; }
+  virtual void DoState(StateBuffer& s) {
+    s.Do(m_upload_setup_in_progress);
+    s.Do(m_needs_resume_mail);
+    s.Do(m_next_steps);
+    s.Do(m_iram_mram_addr);
+    s.Do(m_iram_size);
+  }
 
  protected:
   // Ten mails describing the next microcode (shared by AX, Zelda, GBA...).
@@ -162,6 +170,14 @@ class ROMUCode : public UCode {
       default: break;  // IMEM destination, DMEM length: not needed for HLE
     }
     m_next_parameter = 0;
+  }
+
+ public:
+  void DoState(StateBuffer& s) override {
+    UCode::DoState(s);
+    s.Do(m_next_parameter);
+    s.Do(m_ram_address);
+    s.Do(m_length);
   }
 
  private:
@@ -223,6 +239,12 @@ class GBAUCode : public UCode {
     }
   }
 
+ public:
+  void DoState(StateBuffer& s) override {
+    UCode::DoState(s);
+    s.Do(m_state);
+  }
+
  private:
   int m_state = 0;
 };
@@ -271,6 +293,14 @@ class AXUCode : public UCode {
         }
         break;
     }
+  }
+
+ public:
+  void DoState(StateBuffer& s) override {
+    UCode::DoState(s);
+    s.Do(m_state);
+    s.Do(m_cmdlist_size);
+    s.Do(m_mixer);
   }
 
  private:
@@ -371,6 +401,27 @@ class ZeldaUCode : public UCode {
       HandleMailLight(mail);
     else
       HandleMailDefault(mail);
+  }
+
+ public:
+  void DoState(StateBuffer& s) override {
+    UCode::DoState(s);
+    s.Do(m_flags);
+    s.Do(m_mail_state);
+    s.Do(m_expected_cmd_mails);
+    s.Do(m_cmd_buffer);
+    s.Do(m_read);
+    s.Do(m_write);
+    s.Do(m_pending_commands);
+    s.Do(m_cmd_can_execute);
+    s.Do(m_requested_frames);
+    s.Do(m_curr_frame);
+    s.Do(m_voices_per_frame);
+    s.Do(m_curr_voice);
+    s.Do(m_sync_max_voice);
+    s.Do(m_sync_second_half);
+    s.Do(m_skip_flags);
+    s.Do(m_renderer);
   }
 
  private:
@@ -671,6 +722,29 @@ void Reset() {
   s_halt = s_init = true;
   s_halted = true;
   SetUCode(UCODE_ROM);
+}
+
+void DoState(StateBuffer& s) {
+  s.Marker("DSPHLE");
+  s.Do(s_mails);
+  s.Do(s_last_mail);
+  s.Do(s_halted);
+  s.Do(s_reset);
+  s.Do(s_assert_int);
+  s.Do(s_halt);
+  s.Do(s_init_code);
+  s.Do(s_init);
+  s.Do(s_init_code_clear_cycle);
+  // Microcodes are recreated from their hash, then restore their own state.
+  for (std::unique_ptr<UCode>* slot : {&s_ucode, &s_last_ucode}) {
+    u32 crc = *slot ? (*slot)->crc() : 0xFFFFFFFF;
+    bool present = *slot != nullptr;
+    s.Do(present);
+    s.Do(crc);
+    if (s.IsReading()) *slot = present ? CreateUCode(crc) : nullptr;
+    if (*slot) (*slot)->DoState(s);
+  }
+  s_pending_switch = false;
 }
 
 u16 WriteControl(u16 v) {

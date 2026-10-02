@@ -3,6 +3,7 @@
 #include "core/gekko/cpu.h"
 #include "core/hw/hw.h"
 #include "core/memory.h"
+#include "core/state.h"
 
 namespace PI {
 
@@ -14,6 +15,16 @@ u32 s_reset_code;
 
 void Update() { CPU::SetExternalInterrupt((s_cause & s_mask) != 0); }
 }  // namespace
+
+void DoState(StateBuffer& s) {
+  s.Marker("PI");
+  s.Do(s_cause);
+  s.Do(s_mask);
+  s.Do(s_fifo_base);
+  s.Do(s_fifo_end);
+  s.Do(s_fifo_wptr);
+  s.Do(s_reset_code);
+}
 
 void Reset() {
   s_cause = RESET_SWITCH_STATE;  // reset button released
@@ -84,6 +95,10 @@ u16 s_regs[0x80];
 }
 
 void Reset() { memset(s_regs, 0, sizeof(s_regs)); }
+void DoState(StateBuffer& s) {
+  s.Marker("MI");
+  s.Do(s_regs);
+}
 u16 Read16(u32 off) { return off < 0x100 ? s_regs[off >> 1] : 0; }
 void Write16(u32 off, u16 v) {
   if (off < 0x100) s_regs[off >> 1] = v;

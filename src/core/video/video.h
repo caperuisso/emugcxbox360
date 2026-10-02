@@ -18,6 +18,7 @@ extern u32 g_cp[0x100];    // CP: vertex descriptors, attribute formats, arrays
 extern u32 g_xf[0x1058];   // XF: matrices, lights, transform state
 
 void Reset();
+void DoState(StateBuffer& s);
 
 // Entry points used by the command processor
 void LoadCPReg(u8 reg, u32 value);

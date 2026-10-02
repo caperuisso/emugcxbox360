@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "core/gekko/cpu.h"
+#include "core/state.h"
 
 namespace CoreTiming {
 
@@ -30,6 +31,12 @@ std::vector<Event> s_events;  // kept sorted by time, earliest first
 void Init() {
   s_events.clear();
   g_slice_end = 0;
+}
+
+void DoState(StateBuffer& s) {
+  s.Marker("CoreTiming");
+  s.Do(s_events);
+  s.Do(g_slice_end);
 }
 
 int RegisterEvent(const char* name, Callback cb) {

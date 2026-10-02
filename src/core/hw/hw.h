@@ -6,9 +6,12 @@
 
 #include "core/common.h"
 
+
+
 namespace HW {
 void Init();
 void Reset();
+void DoState(StateBuffer& s);  // every hardware block
 u16 Read16(u32 pa);
 u32 Read32(u32 pa);
 void Write8(u32 pa, u8 v);
@@ -23,6 +26,7 @@ u32 GatherPipeBytes();
 
 // Processor Interface: interrupt controller + CPU-side GX FIFO pointers
 namespace PI {
+void DoState(StateBuffer& s);
 enum Interrupt : u32 {
   INT_ERROR = 0x1,
   INT_RSW = 0x2,
@@ -50,6 +54,7 @@ void FifoWriteBlock(const u8* block);
 
 // Video Interface
 namespace VI {
+void DoState(StateBuffer& s);
 void Init();
 void Reset();
 u16 Read16(u32 off);
@@ -62,6 +67,7 @@ void SetBootTVMode(bool pal);
 
 // Serial Interface (controllers)
 namespace SI {
+void DoState(StateBuffer& s);
 void Reset();
 u32 Read32(u32 off);
 void Write32(u32 off, u32 v);
@@ -70,6 +76,7 @@ void UpdatePolling();  // called once per field
 
 // External Interface (memory cards, IPL/RTC/SRAM)
 namespace EXI {
+void DoState(StateBuffer& s);
 void Init();
 void Reset();
 u32 Read32(u32 off);
@@ -78,6 +85,7 @@ void Write32(u32 off, u32 v);
 
 // DVD Interface
 namespace DI {
+void DoState(StateBuffer& s);
 void Reset();
 bool OpenDisc(const std::string& path);
 void CloseDisc();
@@ -89,6 +97,7 @@ void Write32(u32 off, u32 v);
 
 // DSP interface, ARAM DMA and audio DMA (the DSP core itself is HLE'd later)
 namespace DSP {
+void DoState(StateBuffer& s);
 u8* ARAMPtr();
 u32 ARAMSize();
 void Init();
@@ -99,6 +108,7 @@ void Write16(u32 off, u16 v);
 
 // Audio Interface (streaming + sample counter)
 namespace AI {
+void DoState(StateBuffer& s);
 void Init();
 void Reset();
 u32 Read32(u32 off);
@@ -108,6 +118,7 @@ u32 GetDSPSampleRate();
 
 // Memory Interface (protection registers, stubbed)
 namespace MI {
+void DoState(StateBuffer& s);
 void Reset();
 u16 Read16(u32 off);
 void Write16(u32 off, u16 v);
@@ -115,6 +126,7 @@ void Write16(u32 off, u16 v);
 
 // Command Processor, Pixel Engine and the GX command stream
 namespace GX {
+void DoState(StateBuffer& s);
 void Reset();
 u16 CPRead16(u32 off);
 void CPWrite16(u32 off, u16 v);

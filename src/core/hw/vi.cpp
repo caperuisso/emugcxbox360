@@ -6,6 +6,7 @@
 #include "core/coretiming.h"
 #include "core/hw/hw.h"
 #include "core/memory.h"
+#include "core/state.h"
 #include "platform/platform.h"
 
 namespace VI {
@@ -149,6 +150,13 @@ void LineCallback(u64, s64 late) {
   CoreTiming::ScheduleEvent(s_line_event, (s64)CyclesPerLine() - late);
 }
 }  // namespace
+
+void DoState(StateBuffer& s) {
+  s.Marker("VI");
+  s.Do(s_regs);
+  s.Do(s_di_status);
+  s.Do(s_line);
+}
 
 void Init() { s_line_event = CoreTiming::RegisterEvent("VI line", LineCallback); }
 

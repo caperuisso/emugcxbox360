@@ -3,6 +3,7 @@
 #include <cmath>
 
 #include "core/memory.h"
+#include "core/state.h"
 #include "core/video/video_internal.h"
 
 namespace Video {
@@ -157,6 +158,18 @@ void Reset() {
   TextureReset();
   EFBReset();
   UpdateScissor();
+}
+
+void DoState(StateBuffer& s) {
+  s.Marker("Video");
+  s.Do(g_bp);
+  s.Do(g_cp);
+  s.Do(g_xf);
+  s.Do(s_cached_normal);
+  RasterDoState(s);
+  TextureDoState(s);
+  EFBDoState(s);
+  if (s.IsReading()) UpdateScissor();
 }
 
 void LoadCPReg(u8 reg, u32 value) { g_cp[reg] = value; }

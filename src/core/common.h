@@ -55,5 +55,7 @@ constexpr u32 CPU_CLOCK = 486000000;  // Gekko core clock
 constexpr u32 BUS_CLOCK = 162000000;  // Flipper bus clock
 constexpr u32 TB_DIVIDER = 12;        // timebase ticks = bus/4 = cpu/12
 
+class StateBuffer;  // save states (core/state.h)
+
 void LogPrint(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 #define LOG(...) LogPrint(__VA_ARGS__)

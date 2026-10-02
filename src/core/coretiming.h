@@ -9,6 +9,7 @@ namespace CoreTiming {
 using Callback = void (*)(u64 userdata, s64 cycles_late);
 
 void Init();
+void DoState(StateBuffer& s);
 int RegisterEvent(const char* name, Callback cb);
 void ScheduleEvent(int type, s64 cycles_into_future, u64 userdata = 0);
 void RemoveEvent(int type);

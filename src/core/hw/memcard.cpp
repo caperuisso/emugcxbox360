@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <ctime>
 
+#include "core/state.h"
+
 namespace {
 
 enum : u8 {
@@ -230,6 +232,18 @@ u8 MemoryCard::TransferByte(u8 in) {
   }
   m_position++;
   return out;
+}
+
+void MemoryCard::DoState(StateBuffer& s) {
+  s.Marker("Memcard");
+  s.Do(m_position);
+  s.Do(m_command);
+  s.Do(m_address);
+  s.Do(m_status);
+  s.Do(m_interrupt_switch);
+  s.Do(m_interrupt);
+  s.Do(m_pending_delay);
+  s.Do(m_program);
 }
 
 void MemoryCard::CommandDone() {

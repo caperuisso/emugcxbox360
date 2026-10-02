@@ -9,6 +9,7 @@
 #include "core/hw/hw.h"
 #include "core/loader/boot.h"
 #include "core/memory.h"
+#include "core/state.h"
 
 Host* g_host = nullptr;
 
@@ -57,6 +58,66 @@ bool Boot(const std::string& path) {
   HW::Reset();
   HLE::Clear();
   return Boot::BootFile(path);
+}
+
+namespace {
+constexpr char STATE_MAGIC[8] = {'E', 'M', 'U', 'G', 'C', 'S', 'T', '1'};
+
+void DoMachineState(StateBuffer& s) {
+  CPU::DoState(s);
+  Mem::DoState(s);
+  CoreTiming::DoState(s);
+  HW::DoState(s);
+  s.Marker("End");
+}
+}  // namespace
+
+bool SaveState(const std::string& path) {
+  StateBuffer s(StateBuffer::Mode::Write);
+  DoMachineState(s);
+  FILE* f = fopen(path.c_str(), "wb");
+  if (!f) {
+    LOG("State: cannot write %s\n", path.c_str());
+    return false;
+  }
+  u8 game_id[8] = {};
+  memcpy(game_id, Mem::g_mem1, 6);
+  bool ok = fwrite(STATE_MAGIC, 1, 8, f) == 8 && fwrite(game_id, 1, 8, f) == 8 &&
+            fwrite(s.Data().data(), 1, s.Data().size(), f) == s.Data().size();
+  fclose(f);
+  LOG("State: saved %s (%u KiB)\n", path.c_str(), (unsigned)(s.Data().size() / 1024));
+  return ok;
+}
+
+bool LoadState(const std::string& path) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) {
+    LOG("State: cannot open %s\n", path.c_str());
+    return false;
+  }
+  char magic[8];
+  u8 game_id[8];
+  bool header_ok = fread(magic, 1, 8, f) == 8 && memcmp(magic, STATE_MAGIC, 8) == 0 && fread(game_id, 1, 8, f) == 8;
+  if (!header_ok || memcmp(game_id, Mem::g_mem1, 6) != 0) {
+    LOG("State: %s is not a state for the running game\n", path.c_str());
+    fclose(f);
+    return false;
+  }
+  StateBuffer s(StateBuffer::Mode::Read);
+  fseek(f, 0, SEEK_END);
+  long size = ftell(f) - 16;
+  fseek(f, 16, SEEK_SET);
+  s.Data().resize((size_t)size);
+  bool read_ok = fread(s.Data().data(), 1, (size_t)size, f) == (size_t)size;
+  fclose(f);
+  if (!read_ok) return false;
+  DoMachineState(s);
+  if (!s.Ok()) {
+    LOG("State: %s is corrupt or from another version\n", path.c_str());
+    return false;
+  }
+  LOG("State: loaded %s\n", path.c_str());
+  return true;
 }
 
 void RunFrame() {

@@ -7,6 +7,7 @@
 #include "core/hw/hw.h"
 #include "core/hw/memcard.h"
 #include "core/memory.h"
+#include "core/state.h"
 #include "platform/platform.h"
 
 namespace EXI {
@@ -185,6 +186,15 @@ void StartTransfer(int ch) {
   UpdateInterrupts();
 }
 }  // namespace
+
+void DoState(StateBuffer& s) {
+  s.Marker("EXI");
+  s.Do(s_ch);
+  s.Do(s_ipl);
+  bool card = s_card_a != nullptr;
+  s.Do(card);
+  if (card && s_card_a) s_card_a->DoState(s);
+}
 
 void Init() { s_card_event = CoreTiming::RegisterEvent("Memcard", CardEventCallback); }
 

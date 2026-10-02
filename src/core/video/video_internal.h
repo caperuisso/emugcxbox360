@@ -120,6 +120,11 @@ void LoadTLUT(u32 value);
 void PreloadTMEM(u32 value);
 void TextureReset();
 
+// Save state pieces
+void RasterDoState(StateBuffer& s);
+void TextureDoState(StateBuffer& s);
+void EFBDoState(StateBuffer& s);
+
 // efb.cpp
 void EFBReset();
 bool EFBDepthTest(int x, int y, u32 z);

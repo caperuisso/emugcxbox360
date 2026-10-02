@@ -5,6 +5,7 @@
 
 #include "core/gekko/cpu.h"
 #include "core/hw/hw.h"
+#include "core/state.h"
 #include "core/video/video.h"
 
 namespace Mem {
@@ -160,6 +161,12 @@ void Shutdown() {
 void Clear() {
   memset(g_mem1, 0, MEM1_SIZE);
   memset(g_l2, 0, sizeof(g_l2));
+}
+
+void DoState(StateBuffer& s) {
+  s.Marker("Memory");
+  s.DoBytes(g_mem1, MEM1_SIZE);
+  s.DoBytes(g_l2, L2_SIZE);
 }
 
 void UpdateBATs() {

@@ -5,6 +5,7 @@
 
 #include "core/hw/hw.h"
 #include "core/memory.h"
+#include "core/state.h"
 #include "core/video/video.h"
 
 namespace GX {
@@ -102,6 +103,15 @@ void Reset() {
   s_pending.clear();
   Video::Reset();
   UpdatePEInterrupts();
+}
+
+void DoState(StateBuffer& s) {
+  s.Marker("GX");
+  s.Do(s_cp_regs);
+  s.Do(s_pe_ctrl);
+  s.Do(s_pe_token);
+  s.Do(s_pending);
+  Video::DoState(s);
 }
 
 void ProcessFifo(const u8* data, u32 len) {

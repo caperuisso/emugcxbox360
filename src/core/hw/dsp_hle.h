@@ -11,6 +11,7 @@
 namespace DSPHLE {
 
 void Reset();
+void DoState(StateBuffer& s);
 
 // DSP control register bits owned by the DSP side (mask 0x0C07).
 constexpr u16 CONTROL_MASK = 0x0C07;

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "core/state.h"
 #include "core/video/video_internal.h"
 
 namespace Video {
@@ -53,6 +54,11 @@ inline s16 SignExtend11(u32 v) { return (s16)((s32)(v << 21) >> 21); }
 // share BP addresses), so LoadBP calls this.
 S16x4 g_tev_color_regs[4];
 S16x4 g_tev_konst_regs[4];
+
+void RasterDoState(StateBuffer& s) {
+  s.Do(g_tev_color_regs);
+  s.Do(g_tev_konst_regs);
+}
 
 void SetTevRegister(u32 bp_reg, u32 value) {
   u32 index = (bp_reg - BP_TEV_REGS) >> 1;

@@ -8,6 +8,7 @@
 #include "core/hw/dsp_hle.h"
 #include "core/hw/hw.h"
 #include "core/memory.h"
+#include "core/state.h"
 #include "platform/platform.h"
 
 namespace DSP {
@@ -106,6 +107,24 @@ void HLEUpdateCallback(u64, s64 late) {
   CoreTiming::ScheduleEvent(s_hle_event, HLE_UPDATE_CYCLES - late);
 }
 }  // namespace
+
+void DoState(StateBuffer& s) {
+  s.Marker("DSP");
+  s.DoBytes(s_aram, ARAM_SIZE);
+  s.Do(s_csr);
+  s.Do(s_mail_to_dsp);
+  s.Do(s_ar_size);
+  s.Do(s_ar_mode);
+  s.Do(s_ar_refresh);
+  s.Do(s_ar_mm);
+  s.Do(s_ar_aram);
+  s.Do(s_ar_cnt);
+  s.Do(s_aid_addr);
+  s.Do(s_aid_cur_addr);
+  s.Do(s_aid_ctrl);
+  s.Do(s_aid_left);
+  DSPHLE::DoState(s);
+}
 
 u8* ARAMPtr() { return s_aram; }
 u32 ARAMSize() { return ARAM_SIZE; }
@@ -266,6 +285,15 @@ void Reset() {
   s_scnt_start_cycles = 0;
   CoreTiming::RemoveEvent(s_int_event);
   UpdateInterrupt();
+}
+
+void DoState(StateBuffer& s) {
+  s.Marker("AI");
+  s.Do(s_cr);
+  s.Do(s_vr);
+  s.Do(s_scnt);
+  s.Do(s_it);
+  s.Do(s_scnt_start_cycles);
 }
 
 u32 GetDSPSampleRate() { return (s_cr & CR_DSR) ? 32000 : 48000; }

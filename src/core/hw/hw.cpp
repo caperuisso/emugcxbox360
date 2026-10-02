@@ -3,6 +3,7 @@
 #include "core/hw/hw.h"
 
 #include "core/gekko/cpu.h"
+#include "core/state.h"
 
 namespace HW {
 
@@ -103,6 +104,21 @@ void Reset() {
   AI::Reset();
   MI::Reset();
   GX::Reset();
+}
+
+void DoState(StateBuffer& s) {
+  s.Marker("HW");
+  s.Do(s_gather);
+  s.Do(s_gather_len);
+  PI::DoState(s);
+  MI::DoState(s);
+  VI::DoState(s);
+  SI::DoState(s);
+  EXI::DoState(s);
+  DI::DoState(s);
+  DSP::DoState(s);
+  AI::DoState(s);
+  GX::DoState(s);
 }
 
 u16 Read16(u32 pa) {

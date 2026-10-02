@@ -17,4 +17,9 @@ bool Boot(const std::string& path);
 // Emulates until the VI finishes the next field (~1/60 s of guest time).
 void RunFrame();
 
+// Save states: the whole machine except the disc image and memory card contents.
+// Loading requires the same game to be booted already.
+bool SaveState(const std::string& path);
+bool LoadState(const std::string& path);
+
 }  // namespace System

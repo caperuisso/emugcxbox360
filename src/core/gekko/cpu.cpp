@@ -3,6 +3,7 @@
 
 #include "core/coretiming.h"
 #include "core/memory.h"
+#include "core/state.h"
 
 CPUState cpu;
 
@@ -37,6 +38,12 @@ void Reset() {
   cpu.msr = 0;
   cpu.pc = 0xFFF00100;
   Mem::UpdateBATs();
+}
+
+void DoState(StateBuffer& s) {
+  s.Marker("CPU");
+  s.Do(cpu);
+  if (s.IsReading()) Mem::UpdateBATs();
 }
 
 void RaiseException(u32 exc) { cpu.exceptions |= exc; }

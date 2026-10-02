@@ -135,6 +135,7 @@ bool RunUntil(u32 stop_pc, u64 max_instructions);
 // Executes exactly one instruction (tests / debugging).
 void Step();
 
+void DoState(StateBuffer& s);
 void RaiseException(u32 exc);
 void SetExternalInterrupt(bool active);
 void CheckExceptions();
