@@ -10,6 +10,9 @@ endif
 
 include $(DEVKITXENON)/rules
 
+# Project linker script: keeps .init_array so global C++ constructors run.
+LDSCRIPT := src/platform/xenon/app.lds
+
 TARGET   := emugcxbox360
 BUILD    := build-xenon
 SOURCES  := $(wildcard src/core/*.cpp src/core/*/*.cpp) src/platform/xenon/main_xenon.cpp

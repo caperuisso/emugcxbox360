@@ -4,7 +4,6 @@
 // so games run, and produce silence.
 #include "core/hw/dsp_hle.h"
 
-#include <deque>
 #include <memory>
 #include <utility>
 
@@ -38,7 +37,29 @@ struct PendingMail {
   u32 mail;
   bool interrupt;  // raise the DSP interrupt once this mail has been read
 };
-std::deque<PendingMail> s_mails;
+
+// Fixed-size FIFO (no constructor needed, unlike std::deque).
+struct MailQueue {
+  static constexpr u32 CAPACITY = 256;
+  PendingMail items[CAPACITY];
+  u32 head = 0, count = 0;
+  bool empty() const { return count == 0; }
+  void clear() { head = count = 0; }
+  PendingMail& front() { return items[head]; }
+  void pop_front() {
+    head = (head + 1) % CAPACITY;
+    count--;
+  }
+  void push_back(const PendingMail& m) {
+    if (count == CAPACITY) {
+      LOG("DSP: mail queue full, dropping %08x\n", m.mail);
+      return;
+    }
+    items[(head + count) % CAPACITY] = m;
+    count++;
+  }
+};
+MailQueue s_mails;
 u32 s_last_mail = 0;
 bool s_halted = true;
 

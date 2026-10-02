@@ -184,7 +184,20 @@ std::string PickGame() {
 
 }  // namespace
 
+// libxenon's startup only runs the legacy .ctors list; run .init_array ourselves
+// (see app.lds) so C++ global constructors work like on the PC build.
+extern "C" {
+typedef void (*InitFunc)();
+extern InitFunc __init_array_start[];
+extern InitFunc __init_array_end[];
+}
+
+static void RunGlobalConstructors() {
+  for (InitFunc* f = __init_array_start; f != __init_array_end; ++f) (*f)();
+}
+
 int main() {
+  RunGlobalConstructors();
   xenos_init(VIDEO_MODE_AUTO);
   console_init();
   xenon_make_it_faster(XENON_SPEED_FULL);
