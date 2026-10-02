@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 #include <cstdio>
 
 using u8 = uint8_t;
@@ -42,11 +43,25 @@ inline void StoreBE16(u8* p, u16 v) { v = BE16(v); memcpy(p, &v, 2); }
 inline void StoreBE32(u8* p, u32 v) { v = BE32(v); memcpy(p, &v, 4); }
 inline void StoreBE64(u8* p, u64 v) { v = BE64(v); memcpy(p, &v, 8); }
 
+// The register barriers keep integer <-> float conversions in integer
+// registers: otherwise GCC fuses BitCast<float>(LoadBE32(p)) into lfs/stfs,
+// which raise an alignment exception on the Xenon when p is not aligned.
 template <typename To, typename From>
 inline To BitCast(const From& f) {
   static_assert(sizeof(To) == sizeof(From), "size mismatch");
   To t;
+#if HOST_BIG_ENDIAN
+  if constexpr (std::is_integral<From>::value) {
+    From v = f;
+    __asm__("" : "+r"(v));
+    memcpy(&t, &v, sizeof(To));
+  } else {
+    memcpy(&t, &f, sizeof(To));
+  }
+  if constexpr (std::is_integral<To>::value) __asm__("" : "+r"(t));
+#else
   memcpy(&t, &f, sizeof(To));
+#endif
   return t;
 }
 
