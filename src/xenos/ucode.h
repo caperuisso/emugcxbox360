@@ -195,11 +195,20 @@ inline std::vector<uint32_t> ShaderBuilder::Build() const {
   std::vector<Instr> code;
   std::vector<std::pair<size_t, Clause>> pending;  // cf index -> clause (address patched later)
 
+  // Sequence bits per instruction: bit 0 = fetch, bit 1 = serialize (wait
+  // for the results of the previous instructions). Every switch between
+  // fetch and ALU instructions is serialized, since our clauses mix them with
+  // data dependencies (e.g. texture coordinates computed just before tfetch).
+  int prev_type = -1;
   auto add_execs = [&](const std::vector<Instr>& list, bool last_overall) {
+    prev_type = -1;  // phases are separated by an alloc (the XDK does not serialize there)
     for (size_t i = 0; i < list.size(); i += 6) {
       Clause c{(uint32_t)code.size(), 0, 0};
       for (size_t k = i; k < list.size() && k < i + 6; k++) {
+        int type = list[k].fetch ? 1 : 0;
         if (list[k].fetch) c.seq |= 1u << (2 * c.count);
+        if (prev_type >= 0 && prev_type != type) c.seq |= 2u << (2 * c.count);
+        prev_type = type;
         code.push_back(list[k]);
         c.count++;
       }

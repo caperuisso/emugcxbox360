@@ -15,7 +15,7 @@ extern "C" {
 #include <xenos/xe_internal.h>
 }
 
-#include "platform/xenon/xenos_shaders.h"
+#include "xenos/shaders.h"
 
 namespace XenosGpu {
 

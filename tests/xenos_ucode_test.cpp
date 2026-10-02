@@ -3,7 +3,7 @@
 #include <cstdio>
 #include <string>
 
-#include "platform/xenon/xenos_shaders.h"
+#include "xenos/shaders.h"
 
 static void Write(const char* path, const std::vector<uint32_t>& code) {
   FILE* f = fopen(path, "wb");
