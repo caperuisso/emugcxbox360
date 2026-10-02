@@ -29,6 +29,10 @@ void BootCheckpoint(const char* where) {
   if (g_host) g_host->Checkpoint(where);
 }
 
+void CodeGuard(const char* where) {
+  if (g_host) g_host->CodeGuard(where);
+}
+
 namespace System {
 
 namespace {

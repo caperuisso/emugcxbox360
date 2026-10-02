@@ -74,6 +74,8 @@ class StateBuffer;  // save states (core/state.h)
 
 // Boot progress markers (used by frontends for diagnostics; no-op by default).
 void BootCheckpoint(const char* where);
+// Host code integrity guard, called after disc I/O (no-op on most hosts).
+void CodeGuard(const char* where);
 
 void LogPrint(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 #define LOG(...) LogPrint(__VA_ARGS__)

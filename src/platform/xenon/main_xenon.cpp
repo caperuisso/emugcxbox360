@@ -87,21 +87,38 @@ void SnapshotText() {
   if (g_text_copy) memcpy(g_text_copy, pagetable_end, g_text_words * 4);
 }
 
-void CheckText(const char* where) {
-  if (!g_text_copy) return;
+// Compares the code with the startup copy. Overwritten words are reported and
+// restored (with the caches flushed) so the emulator keeps running; the report
+// tells which operation preceded the damage.
+u32 g_repairs = 0;
+
+bool GuardText(const char* where) {
+  if (!g_text_copy) return true;
+  bool ok = true;
   for (u32 i = 0; i < g_text_words; i++) {
-    if (pagetable_end[i] != g_text_copy[i]) {
-      u32 count = 0, first = i;
-      for (u32 k = i; k < g_text_words; k++)
-        if (pagetable_end[k] != g_text_copy[k]) count++;
-      printf("\n!!! CODE OVERWRITTEN before checkpoint '%s'\n", where);
-      printf("!!! first word %p: %08x -> %08x, %u words changed\n", (void*)&pagetable_end[first],
-             (unsigned)g_text_copy[first], (unsigned)pagetable_end[first], (unsigned)count);
-      printf("!!! please take a photo of this screen\n");
-      for (;;) mdelay(1000);
+    if (LIKELY(pagetable_end[i] == g_text_copy[i])) continue;
+    u32 first = i, count = 0;
+    u32 bad = pagetable_end[i];
+    for (; i < g_text_words; i++) {
+      if (pagetable_end[i] == g_text_copy[i]) {
+        if (i - first > 64) break;  // end of this damaged run
+        continue;
+      }
+      count++;
+      u32* w = &pagetable_end[i];
+      *w = g_text_copy[i];
+      asm volatile("dcbst 0,%0; sync; icbi 0,%0; sync; isync" ::"r"(w) : "memory");
     }
+    if (g_repairs++ < 16)
+      printf("[guard] code at %p overwritten after '%s' (%08x -> %08x, %u words): repaired\n",
+             (void*)&pagetable_end[first], where, (unsigned)g_text_copy[first], (unsigned)bad, (unsigned)count);
+    ok = false;
   }
-  printf("[check] %s: code OK\n", where);
+  return ok;
+}
+
+void CheckText(const char* where) {
+  if (GuardText(where)) printf("[check] %s: code OK\n", where);
 }
 
 // Layout of the Xenos scan-out registers (see libxenon console.c).
@@ -139,6 +156,7 @@ class XenonHost : public Host {
 
   void Log(const char* msg) override { printf("%s", msg); }
   void Checkpoint(const char* where) override { CheckText(where); }
+  void CodeGuard(const char* where) override { GuardText(where); }
 
   int ParallelWorkers() override { return g_worker_count; }
   void RunParallel(int tasks, void (*fn)(int, int, void*), void* ctx) override {
@@ -401,6 +419,7 @@ int main() {
   for (;;) {
     usb_do_poll();
     System::RunFrame();
+    GuardText("frame");
     stats_fields++;
     u64 now = mftb();
     if (tb_diff_msec(now, stats_start) >= 1000) {

@@ -189,7 +189,9 @@ class WIAReader : public DiscReader {
 
   bool ReadFile(u64 offset, void* dst, u64 len) {
     if (fseek(m_file, (long)offset, SEEK_SET) != 0) return false;
-    return fread(dst, 1, len, m_file) == len;
+    bool ok = fread(dst, 1, len, m_file) == len;
+    CodeGuard("disc read");
+    return ok;
   }
 
   bool Decompress(const std::vector<u8>& src, u8* dst, u64 dst_len) {

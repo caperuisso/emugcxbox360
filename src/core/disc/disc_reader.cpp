@@ -20,7 +20,9 @@ class ISOReader : public DiscReader {
   bool Read(u64 offset, void* dst, u64 len) override {
     if (offset + len > m_size) return false;
     if (fseek(m_file, (long)offset, SEEK_SET) != 0) return false;
-    return fread(dst, 1, len, m_file) == len;
+    bool ok = fread(dst, 1, len, m_file) == len;
+    CodeGuard("disc read");
+    return ok;
   }
 
  private:
