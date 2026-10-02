@@ -39,6 +39,8 @@ u32 ReadInstr(u32 ea);
 
 // Translate an effective data address; returns false when unmapped.
 bool TranslateData(u32 ea, u32& pa);
+// Same for instruction fetches (IBATs, MSR.IR).
+bool TranslateInstr(u32 ea, u32& pa);
 
 // Direct pointer into RAM for DMA from hardware (physical address), or nullptr.
 u8* PhysPtr(u32 pa, u32 len);

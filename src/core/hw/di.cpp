@@ -2,6 +2,7 @@
 // DVD Interface: high level emulation of the drive commands games use,
 // backed by a raw GCM/ISO image.
 #include "core/disc/disc_reader.h"
+#include "core/gekko/block_cache.h"
 #include "core/hw/hw.h"
 #include "core/memory.h"
 #include "core/state.h"
@@ -41,6 +42,7 @@ void ExecuteCommand() {
       if (s_cr & 2) {
         u8* dst = Mem::PhysPtr(s_mar, s_length);
         if (!dst || !ReadDisc(offset, dst, s_length)) error = true;
+        BlockCache::Invalidate(s_mar, s_length);
         s_mar += s_length;
         s_length = 0;
       } else {

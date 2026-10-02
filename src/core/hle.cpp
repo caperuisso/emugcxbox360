@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "core/gekko/block_cache.h"
 #include "core/gekko/cpu.h"
 #include "core/memory.h"
 
@@ -39,6 +40,7 @@ bool Patch(u32 addr, Handler handler, const char* name) {
   if (!p) return false;
   Hook h{addr, LoadBE32(p), handler, name};
   StoreBE32(p, (1u << 26) | (u32)s_hooks.size());
+  BlockCache::Invalidate(addr & 0x01FFFFFF, 4);
   s_hooks.push_back(h);
   LOG("HLE: hooked %s at %08x\n", name, addr);
   return true;

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Integer and floating point loads/stores, string/multiple ops, cache control.
+#include "core/gekko/block_cache.h"
 #include "core/gekko/interp_internal.h"
 
 namespace Interpreter {
@@ -234,6 +235,11 @@ void dcbz(u32 i) {
 }
 void cache_nop(u32) {}
 
+void icbi(u32 i) {
+  u32 pa;
+  if (Mem::TranslateData(EA_X(i) & ~31u, pa)) BlockCache::Invalidate(pa, 32);
+}
+
 }  // namespace
 
 // dcbz_l (paired-single group) shares the dcbz implementation.
@@ -304,7 +310,7 @@ void RegisterLoadStore() {
   Reg(T_31, 759, stfdux, "stfdux");
   Reg(T_31, 790, lhbrx, "lhbrx");
   Reg(T_31, 918, sthbrx, "sthbrx");
-  Reg(T_31, 982, cache_nop, "icbi");
+  Reg(T_31, 982, icbi, "icbi");
   Reg(T_31, 983, stfiwx, "stfiwx");
   Reg(T_31, 1014, dcbz, "dcbz");
 }

@@ -10,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "core/gekko/block_cache.h"
 #include "core/gekko/cpu.h"
 #include "core/hle.h"
 #include "core/video/video.h"
@@ -302,6 +303,7 @@ void Usage(const char* argv0) {
           "  --unthrottled     do not limit speed to 60 fields/s\n"
           "  --scale N         window scale (default 1)\n"
           "  --regs            print CPU registers on exit (debugging)\n"
+          "  --interpreter     disable the block cache (plain interpreter)\n"
           "  --osreport ADDR   log calls to the guest OSReport at ADDR (debugging)\n"
           "  --stats           print GPU statistics every 60 fields\n"
           "  --input SPEC      scripted pad input, e.g. 1000:start:10,1300:a:5\n"
@@ -333,6 +335,7 @@ int main(int argc, char** argv) {
     else if (a == "--unthrottled") throttle = false;
     else if (a == "--scale" && i + 1 < argc) scale = atoi(argv[++i]);
     else if (a == "--regs") dump_regs = true;
+    else if (a == "--interpreter") BlockCache::g_enabled = false;
     else if (a == "--stats") stats = true;
     else if (a == "--input" && i + 1 < argc) host.script = ParseScript(argv[++i]);
     else if (a == "--memcard" && i + 1 < argc) host.memcard_path = argv[++i];

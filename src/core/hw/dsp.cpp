@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "core/coretiming.h"
+#include "core/gekko/block_cache.h"
 #include "core/hw/dsp_hle.h"
 #include "core/hw/hw.h"
 #include "core/memory.h"
@@ -62,6 +63,7 @@ void RunARAMDMA() {
         s_aram[a] = mem[k];
     }
   }
+  if (to_mram) BlockCache::Invalidate(s_ar_mm, len);
   s_ar_mm += len;
   s_ar_aram += len;
   s_ar_cnt &= 0x80000000;

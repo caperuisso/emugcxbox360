@@ -2,6 +2,7 @@
 #include "core/gekko/cpu.h"
 
 #include "core/coretiming.h"
+#include "core/gekko/block_cache.h"
 #include "core/memory.h"
 #include "core/state.h"
 
@@ -29,6 +30,7 @@ void TakeException(u32 vector, u32 srr0, u32 srr1_extra) {
 
 void Init() {
   Interpreter::Init();
+  BlockCache::Init();
   s_dec_event = CoreTiming::RegisterEvent("Decrementer", DecrementerCallback);
 }
 
@@ -38,12 +40,16 @@ void Reset() {
   cpu.msr = 0;
   cpu.pc = 0xFFF00100;
   Mem::UpdateBATs();
+  BlockCache::Clear();
 }
 
 void DoState(StateBuffer& s) {
   s.Marker("CPU");
   s.Do(cpu);
-  if (s.IsReading()) Mem::UpdateBATs();
+  if (s.IsReading()) {
+    Mem::UpdateBATs();
+    BlockCache::Clear();
+  }
 }
 
 void RaiseException(u32 exc) { cpu.exceptions |= exc; }
@@ -102,6 +108,10 @@ static inline void ExecuteOne() {
 }
 
 void Run() {
+  if (BlockCache::g_enabled) {
+    BlockCache::Run();
+    return;
+  }
   // Pending async interrupts may have become deliverable since the last slice.
   if (cpu.exceptions) CheckExceptions();
   while (cpu.cycles < CoreTiming::g_slice_end) {

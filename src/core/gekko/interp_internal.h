@@ -13,6 +13,8 @@ using OpFn = void (*)(u32 inst);
 enum Table { T_PRIMARY, T_4, T_19, T_31, T_59, T_63, T_COUNT };
 
 void Reg(int table, u32 ext, OpFn fn, const char* name);
+// Handler for an instruction, with sub-table dispatch already resolved.
+OpFn Resolve(u32 inst);
 // A-form: 5-bit extended opcode, the register field above it is free.
 void RegA(int table, u32 ext5, OpFn fn, const char* name);
 // XO-form in table 31: registers both the OE=0 and OE=1 encodings.

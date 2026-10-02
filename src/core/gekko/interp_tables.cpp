@@ -85,6 +85,11 @@ void Init() {
 
 void Execute(u32 inst) { s_tables[T_PRIMARY][OPCD(inst)](inst); }
 
+OpFn Resolve(u32 inst) {
+  int sub = s_sub_of_primary[OPCD(inst)];
+  return sub < 0 ? s_tables[T_PRIMARY][OPCD(inst)] : s_tables[sub][(inst >> 1) & 0x3FF];
+}
+
 const char* GetOpName(u32 inst) {
   int sub = s_sub_of_primary[OPCD(inst)];
   if (sub < 0) return s_names[T_PRIMARY][OPCD(inst)];
