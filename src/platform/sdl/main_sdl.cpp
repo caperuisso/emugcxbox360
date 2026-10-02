@@ -3,7 +3,10 @@
 #include <SDL.h>
 #include <sys/stat.h>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -76,8 +79,83 @@ std::vector<ScriptedPress> ParseScript(const std::string& spec) {
   return out;
 }
 
+// Persistent worker threads for the renderer's parallel jobs.
+class ThreadPool {
+ public:
+  void Start(int threads) {
+    for (int i = 1; i < threads; i++) m_threads.emplace_back([this, i] { Worker(i); });
+    m_count = threads;
+  }
+  ~ThreadPool() {
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      m_quit = true;
+    }
+    m_cv.notify_all();
+    for (auto& t : m_threads) t.join();
+  }
+  int Count() const { return m_count; }
+
+  void Run(int tasks, void (*fn)(int, int, void*), void* ctx) {
+    {
+      std::lock_guard<std::mutex> lock(m_mutex);
+      m_fn = fn;
+      m_ctx = ctx;
+      m_tasks = tasks;
+      m_next = 1;  // task 0 runs on the calling thread
+      m_done = 0;
+      m_generation++;
+    }
+    m_cv.notify_all();
+    fn(0, tasks, ctx);
+    Finish();
+    std::unique_lock<std::mutex> lock(m_mutex);
+    m_done_cv.wait(lock, [this] { return m_done == m_tasks; });
+  }
+
+ private:
+  void Finish() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (++m_done == m_tasks) m_done_cv.notify_one();
+  }
+  void Worker(int) {
+    u64 seen = 0;
+    for (;;) {
+      int task;
+      void (*fn)(int, int, void*);
+      void* ctx;
+      int tasks;
+      {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_cv.wait(lock, [&] { return m_quit || (m_generation != seen && m_next < m_tasks); });
+        if (m_quit) return;
+        task = m_next++;
+        if (m_next >= m_tasks) seen = m_generation;
+        fn = m_fn;
+        ctx = m_ctx;
+        tasks = m_tasks;
+      }
+      fn(task, tasks, ctx);
+      Finish();
+    }
+  }
+
+  std::vector<std::thread> m_threads;
+  std::mutex m_mutex;
+  std::condition_variable m_cv, m_done_cv;
+  void (*m_fn)(int, int, void*) = nullptr;
+  void* m_ctx = nullptr;
+  int m_tasks = 0, m_next = 0, m_done = 0, m_count = 1;
+  u64 m_generation = 0;
+  bool m_quit = false;
+};
+
 class SDLHost : public Host {
  public:
+  ThreadPool pool;
+  int ParallelWorkers() override { return pool.Count(); }
+  void RunParallel(int tasks, void (*fn)(int, int, void*), void* ctx) override { pool.Run(tasks, fn, ctx); }
+
   std::vector<ScriptedPress> script;
   std::string state_path;
   bool request_save = false, request_load = false;
@@ -304,6 +382,7 @@ void Usage(const char* argv0) {
           "  --scale N         window scale (default 1)\n"
           "  --regs            print CPU registers on exit (debugging)\n"
           "  --interpreter     disable the block cache (plain interpreter)\n"
+          "  --threads N       renderer threads (default: CPU cores, max 16)\n"
           "  --osreport ADDR   log calls to the guest OSReport at ADDR (debugging)\n"
           "  --stats           print GPU statistics every 60 fields\n"
           "  --input SPEC      scripted pad input, e.g. 1000:start:10,1300:a:5\n"
@@ -322,6 +401,7 @@ int main(int argc, char** argv) {
   SDLHost host;
   std::string path, dump;
   long max_frames = -1, dump_every = 0, save_state_at = -1;
+  int render_threads = (int)std::min(16u, std::max(1u, std::thread::hardware_concurrency()));
   std::string load_state, save_state_path;
   int scale = 1;
   bool throttle = true, dump_regs = false, stats = false;
@@ -336,6 +416,7 @@ int main(int argc, char** argv) {
     else if (a == "--scale" && i + 1 < argc) scale = atoi(argv[++i]);
     else if (a == "--regs") dump_regs = true;
     else if (a == "--interpreter") BlockCache::g_enabled = false;
+    else if (a == "--threads" && i + 1 < argc) render_threads = atoi(argv[++i]);
     else if (a == "--stats") stats = true;
     else if (a == "--input" && i + 1 < argc) host.script = ParseScript(argv[++i]);
     else if (a == "--memcard" && i + 1 < argc) host.memcard_path = argv[++i];
@@ -362,6 +443,7 @@ int main(int argc, char** argv) {
   }
   if (host.headless) throttle = false;
 
+  host.pool.Start(std::max(1, std::min(16, render_threads)));
   if (!host.Open(scale) || !System::Init(&host)) return 1;
   if (!System::Boot(path)) {
     fprintf(stderr, "Failed to boot %s\n", path.c_str());

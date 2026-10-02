@@ -109,8 +109,11 @@ void BeginPrimitive(u32 primitive);
 void AddVertex(const OutputVertex& v);
 void EndPrimitive();
 
-// raster.cpp
+// raster.cpp: triangles of one draw call are queued, then rasterized together
+// (possibly on several threads) by EndDraw.
+void BeginDraw();
 void DrawTriangle(const OutputVertex* v0, const OutputVertex* v1, const OutputVertex* v2);
+void EndDraw();
 void UpdateScissor();
 
 // texture.cpp

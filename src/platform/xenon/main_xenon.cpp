@@ -3,6 +3,7 @@
 #include <dirent.h>
 
 #include <algorithm>
+#include <malloc.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -27,6 +28,51 @@ int bdev_enum(int handle, const char** name);
 #include "core/system.h"
 
 namespace {
+
+// ---- Renderer workers on the Xenon's secondary hardware threads ----
+// Hardware threads 1..5 each run a spin loop waiting for jobs. Untested on
+// hardware so far: disabled unless chosen in the game picker.
+struct XenonJob {
+  volatile u32 generation;
+  volatile int tasks;
+  volatile int next;
+  volatile int done;
+  void (*fn)(int, int, void*);
+  void* ctx;
+};
+XenonJob g_job;
+int g_worker_count = 1;  // including the main thread
+
+void RunJobTasks() {
+  for (;;) {
+    int t = __sync_fetch_and_add(&g_job.next, 1);
+    if (t >= g_job.tasks) break;
+    g_job.fn(t, g_job.tasks, g_job.ctx);
+    __sync_fetch_and_add(&g_job.done, 1);
+  }
+}
+
+void WorkerLoop() {
+  u32 seen = 0;
+  for (;;) {
+    while (g_job.generation == seen) asm volatile("or 1,1,1");  // low priority spin
+    seen = g_job.generation;
+    __sync_synchronize();
+    RunJobTasks();
+  }
+}
+
+bool StartWorkers() {
+  xenon_thread_startup();
+  const int stack_size = 256 * 1024;
+  for (int t = 1; t <= 5; t++) {
+    u8* stack = (u8*)memalign(128, stack_size);
+    if (!stack || xenon_run_thread_task(t, stack + stack_size - 256, (void*)WorkerLoop) != 0) break;
+    g_worker_count = t + 1;
+  }
+  printf("Renderer threads: %d\n", g_worker_count);
+  return g_worker_count > 1;
+}
 
 // Layout of the Xenos scan-out registers (see libxenon console.c).
 struct ATIInfo {
@@ -62,6 +108,20 @@ class XenonHost : public Host {
   }
 
   void Log(const char* msg) override { printf("%s", msg); }
+
+  int ParallelWorkers() override { return g_worker_count; }
+  void RunParallel(int tasks, void (*fn)(int, int, void*), void* ctx) override {
+    g_job.fn = fn;
+    g_job.ctx = ctx;
+    g_job.tasks = tasks;
+    g_job.next = 0;
+    g_job.done = 0;
+    __sync_synchronize();
+    g_job.generation++;
+    RunJobTasks();
+    while (g_job.done < tasks) asm volatile("or 1,1,1");
+    __sync_synchronize();
+  }
 
   // ---- Performance overlay (tiny 3x5 font, drawn over the picture) ----
   char overlay[32] = "";
@@ -210,6 +270,8 @@ void ScanDir(const std::string& dir, std::vector<std::string>& out) {
 }
 
 // Simple file picker drawn with the libxenon text console.
+bool g_use_threads = false;
+
 std::string PickGame() {
   std::vector<std::string> games;
   const char* name = nullptr;
@@ -228,7 +290,8 @@ std::string PickGame() {
   for (;;) {
     if (sel != shown) {
       console_clrscr();
-      printf("emugcxbox360 - choose a game (A: start, Guide: quit)\n\n");
+      printf("emugcxbox360 - choose a game (A: start, X: multi-thread renderer %s, Guide: quit)\n\n",
+             g_use_threads ? "ON" : "OFF");
       int first = std::max(0, sel - 10);
       for (int i = first; i < (int)games.size() && i < first + 20; i++)
         printf("%s %s\n", i == sel ? ">" : " ", games[i].c_str());
@@ -240,6 +303,12 @@ std::string PickGame() {
     get_controller_data(&c, 0);
     if (c.logo) return "";
     if (c.a) return games[sel];
+    static bool x_was_down = false;
+    if (c.x && !x_was_down) {
+      g_use_threads = !g_use_threads;
+      shown = -1;  // redraw
+    }
+    x_was_down = c.x;
     bool down = c.down || c.s1_y < -20000, up = c.up || c.s1_y > 20000;
     if ((down || up) && repeat-- <= 0) {
       sel = std::clamp(sel + (down ? 1 : -1), 0, (int)games.size() - 1);
@@ -282,6 +351,7 @@ int main() {
   std::string game = PickGame();
   if (game.empty()) return 0;
 
+  if (g_use_threads) StartWorkers();
   host.Attach();
   host.memcard_dir = game.substr(0, game.rfind('/') + 1);  // card lives next to the game
   if (!System::Init(&host) || !System::Boot(game)) {

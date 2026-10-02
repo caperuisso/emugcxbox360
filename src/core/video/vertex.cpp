@@ -212,6 +212,7 @@ void Draw(u8 cmd, u32 count, const u8* data) {
   g_stats.primitives++;
   g_stats.vertices += count;
 
+  BeginDraw();
   BeginPrimitive(primitive);
   const u8* p = data;
   for (u32 v = 0; v < count; v++) {
@@ -278,6 +279,7 @@ void Draw(u8 cmd, u32 count, const u8* data) {
     AddVertex(out);
   }
   EndPrimitive();
+  EndDraw();
 }
 
 }  // namespace Video

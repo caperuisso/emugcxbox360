@@ -40,6 +40,12 @@ class Host {
   virtual void PollPad(int port, PadState& out) = 0;
   // Interleaved stereo s16 samples (host endianness)
   virtual void PushAudio(const s16* samples, int frames, int rate) { (void)samples; (void)frames; (void)rate; }
+  // Parallel work for the renderer: runs fn(task, tasks, ctx) for every task
+  // in [0, tasks) and returns when all are done. Default: sequential.
+  virtual int ParallelWorkers() { return 1; }
+  virtual void RunParallel(int tasks, void (*fn)(int task, int tasks, void* ctx), void* ctx) {
+    for (int i = 0; i < tasks; i++) fn(i, tasks, ctx);
+  }
   // Raw memory card image for slot 0 (A) / 1 (B); empty string = no card.
   virtual std::string MemcardPath(int slot) { (void)slot; return std::string(); }
 };

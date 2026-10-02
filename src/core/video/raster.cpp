@@ -2,9 +2,11 @@
 // Triangle rasterizer and the TEV (texture environment) pixel pipeline.
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 #include "core/state.h"
 #include "core/video/video_internal.h"
+#include "platform/platform.h"
 
 namespace Video {
 
@@ -36,7 +38,6 @@ Slope MakeSlope(float f0, float f1, float f2, const SlopeContext& c) {
   return s;
 }
 
-Slope s_z, s_w, s_color[2][4], s_tex[8][3];
 
 // ---- TEV state cached per triangle ----
 struct S16x4 {
@@ -162,12 +163,12 @@ inline s32 WrapIndirect(s32 coord, u32 mode) {
   }
 }
 
-void ShadePixel(const PixelInput& in) {
+bool ShadePixel(const PixelInput& in) {
   u32 zcomp = g_bp[BP_ZCOMPARE];
   u32 zmode = g_bp[BP_ZMODE];
   u32 z = in.z;
   bool early_z = Bits(zcomp, 6, 1) && !(g_bp[BP_ZTEX2] & 0xC);
-  if (early_z && (zmode & 1) && !EFBDepthTest(in.x, in.y, z)) return;
+  if (early_z && (zmode & 1) && !EFBDepthTest(in.x, in.y, z)) return false;
 
   S16x4 reg[4];
   for (int i = 0; i < 4; i++) reg[i] = g_tev_color_regs[i];
@@ -406,7 +407,7 @@ void ShadePixel(const PixelInput& in) {
   u32 adest = Bits(g_bp[BP_TEV_COLOR_ENV + last * 2 + 1], 22, 2);
   u8 out[4] = {(u8)reg[cdest].r, (u8)reg[cdest].g, (u8)reg[cdest].b, (u8)reg[adest].a};
 
-  if (!AlphaTest(out[3])) return;
+  if (!AlphaTest(out[3])) return false;
 
   // Z texture
   u32 ztex2 = g_bp[BP_ZTEX2];
@@ -454,10 +455,10 @@ void ShadePixel(const PixelInput& in) {
     out[2] = (u8)((out[2] * inv + fi * fb) >> 8);
   }
 
-  if (!early_z && (zmode & 1) && !EFBDepthTest(in.x, in.y, z)) return;
+  if (!early_z && (zmode & 1) && !EFBDepthTest(in.x, in.y, z)) return false;
   if ((zmode & 1) && (zmode & 0x10)) EFBWriteDepth(in.x, in.y, z);
-  g_stats.pixels++;
   EFBBlend(in.x, in.y, out);
+  return true;
 }
 
 // Fixed-point log2 used for texture LOD (4 fractional bits), as in hardware.
@@ -514,12 +515,120 @@ void LoadSwapTables() {
   }
 }
 
-void DrawTriangle(const OutputVertex* v0, const OutputVertex* v1, const OutputVertex* v2) {
+namespace {
+
+// Everything a worker needs to rasterize one triangle (read-only once queued).
+struct TriSetup {
+  int minx, maxx, miny, maxy;
+  s64 C1, C2, C3;
+  s32 DX12, DX23, DX31, DY12, DY23, DY31;
+  bool flip;
+  Slope z, w, color[2][4], tex[8][3];
+};
+
+std::vector<TriSetup> s_batch;  // triangles of the current draw call
+u64 s_batch_area = 0;
+u32 s_iref;
+
+void RasterizeTriangle(const TriSetup& t, int task, int tasks, u32& pixels) {
+  auto inside = [&](int x, int y) {
+    s64 px = (s64)x << 4, py = (s64)y << 4;
+    s64 e1 = t.C1 + t.DX12 * py - t.DY12 * px;
+    s64 e2 = t.C2 + t.DX23 * py - t.DY23 * px;
+    s64 e3 = t.C3 + t.DX31 * py - t.DY31 * px;
+    if (t.flip) return e1 < 0 && e2 < 0 && e3 < 0;
+    return e1 > 0 && e2 > 0 && e3 > 0;
+  };
+
+  PixelInput px;
+  memset(&px, 0, sizeof(px));  // unused color channels read as zero
+  // Process 2x2 blocks so texture LOD can use screen-space derivatives.
+  // Block rows are interleaved between workers, which therefore never touch
+  // the same EFB pixels.
+  for (int by = t.miny & ~1; by < t.maxy; by += 2) {
+    if (tasks > 1 && ((by >> 1) % tasks) != task) continue;
+    for (int bx = t.minx & ~1; bx < t.maxx; bx += 2) {
+      bool cover[2][2];
+      bool any = false;
+      for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+          int x = bx + i, y = by + j;
+          cover[i][j] = x >= t.minx && x < t.maxx && y >= t.miny && y < t.maxy && inside(x, y);
+          any |= cover[i][j];
+        }
+      if (!any) continue;
+
+      // Perspective-correct texture coordinates for the block
+      float uv[2][2][8][2];
+      for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+          float cx = bx + i + 0.5f, cy = by + j + 0.5f;
+          float inv_w = 1.0f / t.w.At(cx, cy);
+          for (u32 c = 0; c < s_num_texgens; c++) {
+            float proj = inv_w;
+            float q = t.tex[c][2].At(cx, cy) * inv_w;
+            if (q != 0.0f) proj = inv_w / q;
+            uv[i][j][c][0] = t.tex[c][0].At(cx, cy) * proj;
+            uv[i][j][c][1] = t.tex[c][1].At(cx, cy) * proj;
+          }
+        }
+      // LOD per TEV stage / indirect stage
+      for (u32 st = 0; st <= s_num_stages; st++) {
+        const StageConfig& cfg = s_stage[st];
+        if (!cfg.tex_enable) continue;
+        u32 tc = cfg.texcoord;
+        ComputeLOD(cfg.texmap, uv[0][0][tc][0] - uv[1][0][tc][0], uv[0][0][tc][0] - uv[0][1][tc][0],
+                   uv[0][0][tc][1] - uv[1][0][tc][1], uv[0][0][tc][1] - uv[0][1][tc][1], px.lod[st], px.linear[st]);
+      }
+      for (u32 st = 0; st < s_num_ind; st++) {
+        u32 map = Bits(s_iref, st * 6, 3), tc = Bits(s_iref, st * 6 + 3, 3);
+        if (tc >= s_num_texgens) tc = 0;
+        ComputeLOD(map, uv[0][0][tc][0] - uv[1][0][tc][0], uv[0][0][tc][0] - uv[0][1][tc][0],
+                   uv[0][0][tc][1] - uv[1][0][tc][1], uv[0][0][tc][1] - uv[0][1][tc][1], px.ind_lod[st],
+                   px.ind_linear[st]);
+      }
+
+      for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+          if (!cover[i][j]) continue;
+          int x = bx + i, y = by + j;
+          float cx = x + 0.5f, cy = y + 0.5f;
+          px.x = x;
+          px.y = y;
+          px.z = (u32)std::clamp(t.z.At(cx, cy), 0.0f, 16777215.0f);
+          for (u32 c = 0; c < std::min<u32>(s_num_chans, 2); c++)
+            for (int k = 0; k < 4; k++)
+              px.color[c][k] = (u8)std::clamp(t.color[c][k].At(cx, cy), 0.0f, 255.0f);
+          for (u32 c = 0; c < s_num_texgens; c++) {
+            px.uv[c][0] = (s32)(uv[i][j][c][0] * 128.0f);
+            px.uv[c][1] = (s32)(uv[i][j][c][1] * 128.0f);
+          }
+          if (ShadePixel(px)) pixels++;
+        }
+    }
+  }
+}
+
+struct RasterJob {
+  u32 pixels[16];
+};
+
+void RasterTask(int task, int tasks, void* ctx) {
+  RasterJob* job = (RasterJob*)ctx;
+  u32 pixels = 0;
+  for (const TriSetup& t : s_batch) RasterizeTriangle(t, task, tasks, pixels);
+  job->pixels[task] = pixels;
+}
+
+}  // namespace
+
+void BeginDraw() {
   u32 genmode = g_bp[BP_GENMODE];
   s_num_texgens = Bits(genmode, 0, 4);
   s_num_chans = Bits(genmode, 4, 3);
   s_num_stages = Bits(genmode, 10, 4);
   s_num_ind = Bits(genmode, 16, 3);
+  s_iref = g_bp[BP_IREF];
   LoadSwapTables();
   for (u32 stage = 0; stage <= s_num_stages; stage++) {
     StageConfig& c = s_stage[stage];
@@ -539,7 +648,28 @@ void DrawTriangle(const OutputVertex* v0, const OutputVertex* v1, const OutputVe
     S16x4 ka = KonstColor(Bits(ksel, kshift + 5, 5));
     c.konst = {kc.r, kc.g, kc.b, ka.a};
   }
+  s_batch.clear();
+  s_batch_area = 0;
+}
 
+void EndDraw() {
+  if (s_batch.empty()) return;
+  // Small batches are not worth waking the workers.
+  int workers = g_host ? g_host->ParallelWorkers() : 1;
+  int tasks = (workers > 1 && s_batch_area >= 4096) ? std::min(workers, 16) : 1;
+  RasterJob job;
+  memset(&job, 0, sizeof(job));
+  if (tasks > 1)
+    g_host->RunParallel(tasks, RasterTask, &job);
+  else
+    RasterTask(0, 1, &job);
+  for (int i = 0; i < tasks; i++) g_stats.pixels += job.pixels[i];
+  s_batch.clear();
+  s_batch_area = 0;
+}
+
+void DrawTriangle(const OutputVertex* v0, const OutputVertex* v1, const OutputVertex* v2) {
+  TriSetup t;
   // Screen -> EFB coordinates
   float xs[3] = {v0->screen.x - 342.0f - s_x_off, v1->screen.x - 342.0f - s_x_off, v2->screen.x - 342.0f - s_x_off};
   float ys[3] = {v0->screen.y - 342.0f - s_y_off, v1->screen.y - 342.0f - s_y_off, v2->screen.y - 342.0f - s_y_off};
@@ -549,13 +679,11 @@ void DrawTriangle(const OutputVertex* v0, const OutputVertex* v1, const OutputVe
   s32 X1 = fx(xs[0]), X2 = fx(xs[1]), X3 = fx(xs[2]);
   s32 Y1 = fx(ys[0]), Y2 = fx(ys[1]), Y3 = fx(ys[2]);
 
-  int minx = (std::min({X1, X2, X3}) + 0xF) >> 4, maxx = (std::max({X1, X2, X3}) + 0xF) >> 4;
-  int miny = (std::min({Y1, Y2, Y3}) + 0xF) >> 4, maxy = (std::max({Y1, Y2, Y3}) + 0xF) >> 4;
-  minx = std::max(minx, s_sc_left);
-  maxx = std::min(maxx, s_sc_right);
-  miny = std::max(miny, s_sc_top);
-  maxy = std::min(maxy, s_sc_bottom);
-  if (minx >= maxx || miny >= maxy) return;
+  t.minx = std::max((std::min({X1, X2, X3}) + 0xF) >> 4, s_sc_left);
+  t.maxx = std::min((std::max({X1, X2, X3}) + 0xF) >> 4, s_sc_right);
+  t.miny = std::max((std::min({Y1, Y2, Y3}) + 0xF) >> 4, s_sc_top);
+  t.maxy = std::min((std::max({Y1, Y2, Y3}) + 0xF) >> 4, s_sc_bottom);
+  if (t.minx >= t.maxx || t.miny >= t.maxy) return;
 
   SlopeContext ctx;
   ctx.x0 = xs[0];
@@ -567,105 +695,35 @@ void DrawTriangle(const OutputVertex* v0, const OutputVertex* v1, const OutputVe
   ctx.det = ctx.dx20 * ctx.dy10 - ctx.dx10 * ctx.dy20;
   if (ctx.det == 0.0f) return;
 
-  s_z = MakeSlope(v0->screen.z, v1->screen.z, v2->screen.z, ctx);
+  t.z = MakeSlope(v0->screen.z, v1->screen.z, v2->screen.z, ctx);
   float w[3] = {1.0f / v0->proj[3], 1.0f / v1->proj[3], 1.0f / v2->proj[3]};
-  s_w = MakeSlope(w[0], w[1], w[2], ctx);
+  t.w = MakeSlope(w[0], w[1], w[2], ctx);
   for (u32 c = 0; c < 2; c++)
-    for (int i = 0; i < 4; i++) s_color[c][i] = MakeSlope(v0->color[c][i], v1->color[c][i], v2->color[c][i], ctx);
-  for (u32 t = 0; t < s_num_texgens; t++) {
-    s_tex[t][0] = MakeSlope(v0->texcoords[t].x * w[0], v1->texcoords[t].x * w[1], v2->texcoords[t].x * w[2], ctx);
-    s_tex[t][1] = MakeSlope(v0->texcoords[t].y * w[0], v1->texcoords[t].y * w[1], v2->texcoords[t].y * w[2], ctx);
-    s_tex[t][2] = MakeSlope(v0->texcoords[t].z * w[0], v1->texcoords[t].z * w[1], v2->texcoords[t].z * w[2], ctx);
+    for (int i = 0; i < 4; i++) t.color[c][i] = MakeSlope(v0->color[c][i], v1->color[c][i], v2->color[c][i], ctx);
+  for (u32 c = 0; c < s_num_texgens; c++) {
+    t.tex[c][0] = MakeSlope(v0->texcoords[c].x * w[0], v1->texcoords[c].x * w[1], v2->texcoords[c].x * w[2], ctx);
+    t.tex[c][1] = MakeSlope(v0->texcoords[c].y * w[0], v1->texcoords[c].y * w[1], v2->texcoords[c].y * w[2], ctx);
+    t.tex[c][2] = MakeSlope(v0->texcoords[c].z * w[0], v1->texcoords[c].z * w[1], v2->texcoords[c].z * w[2], ctx);
   }
 
   // Edge equations (top-left fill convention)
-  const s32 DX12 = X1 - X2, DX23 = X2 - X3, DX31 = X3 - X1;
-  const s32 DY12 = Y1 - Y2, DY23 = Y2 - Y3, DY31 = Y3 - Y1;
-  s64 C1 = (s64)DY12 * X1 - (s64)DX12 * Y1;
-  s64 C2 = (s64)DY23 * X2 - (s64)DX23 * Y2;
-  s64 C3 = (s64)DY31 * X3 - (s64)DX31 * Y3;
-  if (DY12 < 0 || (DY12 == 0 && DX12 > 0)) C1++;
-  if (DY23 < 0 || (DY23 == 0 && DX23 > 0)) C2++;
-  if (DY31 < 0 || (DY31 == 0 && DX31 > 0)) C3++;
+  t.DX12 = X1 - X2;
+  t.DX23 = X2 - X3;
+  t.DX31 = X3 - X1;
+  t.DY12 = Y1 - Y2;
+  t.DY23 = Y2 - Y3;
+  t.DY31 = Y3 - Y1;
+  t.C1 = (s64)t.DY12 * X1 - (s64)t.DX12 * Y1;
+  t.C2 = (s64)t.DY23 * X2 - (s64)t.DX23 * Y2;
+  t.C3 = (s64)t.DY31 * X3 - (s64)t.DX31 * Y3;
+  if (t.DY12 < 0 || (t.DY12 == 0 && t.DX12 > 0)) t.C1++;
+  if (t.DY23 < 0 || (t.DY23 == 0 && t.DX23 > 0)) t.C2++;
+  if (t.DY31 < 0 || (t.DY31 == 0 && t.DX31 > 0)) t.C3++;
   // Orientation: make the inside test "> 0" regardless of winding.
-  bool flip = ((s64)DX12 * DY31 - (s64)DY12 * DX31) < 0;
+  t.flip = ((s64)t.DX12 * t.DY31 - (s64)t.DY12 * t.DX31) < 0;
 
-  auto inside = [&](int x, int y) {
-    s64 px = (s64)x << 4, py = (s64)y << 4;
-    s64 e1 = C1 + DX12 * py - DY12 * px;
-    s64 e2 = C2 + DX23 * py - DY23 * px;
-    s64 e3 = C3 + DX31 * py - DY31 * px;
-    if (flip) return e1 < 0 && e2 < 0 && e3 < 0;
-    return e1 > 0 && e2 > 0 && e3 > 0;
-  };
-
-  u32 iref = g_bp[BP_IREF];
-  PixelInput px;
-  memset(&px, 0, sizeof(px));  // unused color channels read as zero
-  // Process 2x2 blocks so texture LOD can use screen-space derivatives.
-  for (int by = miny & ~1; by < maxy; by += 2) {
-    for (int bx = minx & ~1; bx < maxx; bx += 2) {
-      bool cover[2][2];
-      bool any = false;
-      for (int j = 0; j < 2; j++)
-        for (int i = 0; i < 2; i++) {
-          int x = bx + i, y = by + j;
-          cover[i][j] = x >= minx && x < maxx && y >= miny && y < maxy && inside(x, y);
-          any |= cover[i][j];
-        }
-      if (!any) continue;
-
-      // Perspective-correct texture coordinates for the block
-      float uv[2][2][8][2];
-      for (int j = 0; j < 2; j++)
-        for (int i = 0; i < 2; i++) {
-          float cx = bx + i + 0.5f, cy = by + j + 0.5f;
-          float inv_w = 1.0f / s_w.At(cx, cy);
-          for (u32 t = 0; t < s_num_texgens; t++) {
-            float proj = inv_w;
-            float q = s_tex[t][2].At(cx, cy) * inv_w;
-            if (q != 0.0f) proj = inv_w / q;
-            uv[i][j][t][0] = s_tex[t][0].At(cx, cy) * proj;
-            uv[i][j][t][1] = s_tex[t][1].At(cx, cy) * proj;
-          }
-        }
-      // LOD per TEV stage / indirect stage
-      for (u32 s = 0; s <= s_num_stages; s++) {
-        u32 order = g_bp[BP_TREF + (s >> 1)];
-        u32 shift = (s & 1) ? 12 : 0;
-        if (!Bits(order, shift + 6, 1)) continue;
-        u32 map = Bits(order, shift, 3), tc = Bits(order, shift + 3, 3);
-        if (tc >= s_num_texgens) tc = 0;
-        ComputeLOD(map, uv[0][0][tc][0] - uv[1][0][tc][0], uv[0][0][tc][0] - uv[0][1][tc][0],
-                   uv[0][0][tc][1] - uv[1][0][tc][1], uv[0][0][tc][1] - uv[0][1][tc][1], px.lod[s], px.linear[s]);
-      }
-      for (u32 s = 0; s < s_num_ind; s++) {
-        u32 map = Bits(iref, s * 6, 3), tc = Bits(iref, s * 6 + 3, 3);
-        if (tc >= s_num_texgens) tc = 0;
-        ComputeLOD(map, uv[0][0][tc][0] - uv[1][0][tc][0], uv[0][0][tc][0] - uv[0][1][tc][0],
-                   uv[0][0][tc][1] - uv[1][0][tc][1], uv[0][0][tc][1] - uv[0][1][tc][1], px.ind_lod[s],
-                   px.ind_linear[s]);
-      }
-
-      for (int j = 0; j < 2; j++)
-        for (int i = 0; i < 2; i++) {
-          if (!cover[i][j]) continue;
-          int x = bx + i, y = by + j;
-          float cx = x + 0.5f, cy = y + 0.5f;
-          px.x = x;
-          px.y = y;
-          px.z = (u32)std::clamp(s_z.At(cx, cy), 0.0f, 16777215.0f);
-          for (u32 c = 0; c < std::min<u32>(s_num_chans, 2); c++)
-            for (int k = 0; k < 4; k++)
-              px.color[c][k] = (u8)std::clamp(s_color[c][k].At(cx, cy), 0.0f, 255.0f);
-          for (u32 t = 0; t < s_num_texgens; t++) {
-            px.uv[t][0] = (s32)(uv[i][j][t][0] * 128.0f);
-            px.uv[t][1] = (s32)(uv[i][j][t][1] * 128.0f);
-          }
-          ShadePixel(px);
-        }
-    }
-  }
+  s_batch_area += (u64)(t.maxx - t.minx) * (u64)(t.maxy - t.miny);
+  s_batch.push_back(t);
 }
 
 }  // namespace Video
