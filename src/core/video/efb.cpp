@@ -57,19 +57,6 @@ inline bool Compare(u32 func, u32 a, u32 b) {
   }
 }
 
-u8 BlendFactor(u32 f, bool is_src, const u8* src, const u8* dst, int ch) {
-  switch (f) {
-    case 0: return 0;
-    case 1: return 255;
-    case 2: return is_src ? dst[ch] : src[ch];
-    case 3: return (u8)(255 - (is_src ? dst[ch] : src[ch]));
-    case 4: return src[3];
-    case 5: return (u8)(255 - src[3]);
-    case 6: return dst[3];
-    default: return (u8)(255 - dst[3]);
-  }
-}
-
 u8 LogicOp(u32 op, u8 s, u8 d) {
   switch (op) {
     case 0: return 0;
@@ -308,43 +295,117 @@ void EFBReset() {
   }
 }
 
-bool EFBDepthTest(int x, int y, u32 z) {
-  u32 func = Bits(g_bp[BP_ZMODE], 1, 3);
-  return Compare(func, z, s_depth[y * EFB_WIDTH + x]);
-}
+bool EFBDepthTest(int x, int y, u32 z, u32 func) { return Compare(func, z, s_depth[y * EFB_WIDTH + x]); }
 
 void EFBWriteDepth(int x, int y, u32 z) { s_depth[y * EFB_WIDTH + x] = z & 0xFFFFFF; }
 
-void EFBBlend(int x, int y, const u8 rgba[4]) {
+namespace {
+// Blend state decoded once per draw call
+enum BlendMode { BLEND_NONE, BLEND_FACTORS, BLEND_LOGIC, BLEND_SUBTRACT };
+struct BlendState {
+  BlendMode mode;
+  u32 sf, df, logic_op;
+  bool const_alpha;
+  u8 const_alpha_value;
+  bool color_update, alpha_update;
+  u32 format;
+  bool dst_has_alpha;
+};
+BlendState s_blend;
+
+inline void Factors(u32 f, bool is_src, const u8* src, const u8* dst, u32* out) {
+  switch (f) {
+    case 0: out[0] = out[1] = out[2] = out[3] = 0; break;
+    case 1: out[0] = out[1] = out[2] = out[3] = 255; break;
+    case 2: {
+      const u8* c = is_src ? dst : src;
+      out[0] = c[0], out[1] = c[1], out[2] = c[2], out[3] = c[3];
+      break;
+    }
+    case 3: {
+      const u8* c = is_src ? dst : src;
+      out[0] = 255 - c[0], out[1] = 255 - c[1], out[2] = 255 - c[2], out[3] = 255 - c[3];
+      break;
+    }
+    case 4: out[0] = out[1] = out[2] = out[3] = src[3]; break;
+    case 5: out[0] = out[1] = out[2] = out[3] = 255 - src[3]; break;
+    case 6: out[0] = out[1] = out[2] = out[3] = dst[3]; break;
+    default: out[0] = out[1] = out[2] = out[3] = 255 - dst[3]; break;
+  }
+}
+
+inline void QuantizeFmt(u32 fmt, u8* c) {
+  switch (fmt) {
+    case 1:  // RGBA6
+      for (int i = 0; i < 4; i++) c[i] = (u8)((c[i] & 0xFC) | (c[i] >> 6));
+      break;
+    case 2:  // RGB565
+      c[0] = (u8)((c[0] & 0xF8) | (c[0] >> 5));
+      c[1] = (u8)((c[1] & 0xFC) | (c[1] >> 6));
+      c[2] = (u8)((c[2] & 0xF8) | (c[2] >> 5));
+      c[3] = 255;
+      break;
+    default:  // RGB8: no alpha channel
+      c[3] = 255;
+      break;
+  }
+}
+}  // namespace
+
+void PrepareBlend() {
   u32 blend = g_bp[BP_BLENDMODE];
+  BlendState& b = s_blend;
+  if (Bits(blend, 11, 1)) b.mode = BLEND_SUBTRACT;
+  else if (Bits(blend, 0, 1)) b.mode = BLEND_FACTORS;
+  else if (Bits(blend, 1, 1)) b.mode = BLEND_LOGIC;
+  else b.mode = BLEND_NONE;
+  b.sf = Bits(blend, 8, 3);
+  b.df = Bits(blend, 5, 3);
+  b.logic_op = Bits(blend, 12, 4);
+  u32 ca = g_bp[BP_CONSTANTALPHA];
+  b.const_alpha = Bits(ca, 8, 1);
+  b.const_alpha_value = (u8)Bits(ca, 0, 8);
+  b.color_update = Bits(blend, 3, 1);
+  b.alpha_update = Bits(blend, 4, 1);
+  b.format = PixelFormat();
+  b.dst_has_alpha = b.format == 1;
+}
+
+void EFBBlend(int x, int y, const u8 rgba[4]) {
+  const BlendState& b = s_blend;
   u32& px = s_color[y * EFB_WIDTH + x];
   u8 dst[4], out[4];
   Unpack(px, dst);
-  if (PixelFormat() != 1) dst[3] = 255;  // formats without alpha read as opaque
+  if (!b.dst_has_alpha) dst[3] = 255;  // formats without alpha read as opaque
 
-  if (Bits(blend, 11, 1)) {  // subtract
-    for (int i = 0; i < 4; i++) out[i] = (u8)std::max(0, (int)dst[i] - (int)rgba[i]);
-  } else if (Bits(blend, 0, 1)) {
-    u32 sf = Bits(blend, 8, 3), df = Bits(blend, 5, 3);
-    for (int i = 0; i < 4; i++) {
-      u32 s = BlendFactor(sf, true, rgba, dst, i), d = BlendFactor(df, false, rgba, dst, i);
-      s += s >> 7;
-      d += d >> 7;
-      out[i] = (u8)std::min<u32>(255, (rgba[i] * s + dst[i] * d) >> 8);
+  switch (b.mode) {
+    case BLEND_SUBTRACT:
+      for (int i = 0; i < 4; i++) out[i] = (u8)std::max(0, (int)dst[i] - (int)rgba[i]);
+      break;
+    case BLEND_FACTORS: {
+      u32 sfac[4], dfac[4];
+      Factors(b.sf, true, rgba, dst, sfac);
+      Factors(b.df, false, rgba, dst, dfac);
+      for (int i = 0; i < 4; i++) {
+        u32 s = sfac[i] + (sfac[i] >> 7), d = dfac[i] + (dfac[i] >> 7);
+        u32 v = (rgba[i] * s + dst[i] * d) >> 8;
+        out[i] = (u8)(v > 255 ? 255 : v);
+      }
+      break;
     }
-  } else if (Bits(blend, 1, 1)) {
-    u32 op = Bits(blend, 12, 4);
-    for (int i = 0; i < 4; i++) out[i] = LogicOp(op, rgba[i], dst[i]);
-  } else {
-    memcpy(out, rgba, 4);
+    case BLEND_LOGIC:
+      for (int i = 0; i < 4; i++) out[i] = LogicOp(b.logic_op, rgba[i], dst[i]);
+      break;
+    default:
+      memcpy(out, rgba, 4);
+      break;
   }
 
-  u32 ca = g_bp[BP_CONSTANTALPHA];
-  if (Bits(ca, 8, 1)) out[3] = (u8)Bits(ca, 0, 8);
-  Quantize(out);
+  if (b.const_alpha) out[3] = b.const_alpha_value;
+  QuantizeFmt(b.format, out);
   Unpack(px, dst);
-  if (Bits(blend, 3, 1)) dst[0] = out[0], dst[1] = out[1], dst[2] = out[2];
-  if (Bits(blend, 4, 1)) dst[3] = out[3];
+  if (b.color_update) dst[0] = out[0], dst[1] = out[1], dst[2] = out[2];
+  if (b.alpha_update) dst[3] = out[3];
   px = Pack(dst);
 }
 

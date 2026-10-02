@@ -134,7 +134,9 @@ void EFBDoState(StateBuffer& s);
 
 // efb.cpp
 void EFBReset();
-bool EFBDepthTest(int x, int y, u32 z);
+bool EFBDepthTest(int x, int y, u32 z, u32 func);
+// Decodes the blend registers before a draw (EFBBlend uses the result).
+void PrepareBlend();
 void EFBWriteDepth(int x, int y, u32 z);
 void EFBBlend(int x, int y, const u8 rgba[4]);
 void EFBCopy(u32 cmd);
