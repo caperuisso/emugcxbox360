@@ -461,25 +461,28 @@ bool ShadePixel(const PixelInput& in) {
   return true;
 }
 
-// Fixed-point log2 used for texture LOD (4 fractional bits), as in hardware.
-inline s32 FixedLog2(float f) {
-  u32 x = BitCast<u32>(f);
-  s32 log_int = (s32)((x & 0x7F800000) >> 19) - 2032;
-  s32 log_frac = (s32)((x & 0x007FFFFF) >> 19);
-  return log_int + log_frac;
+// Fixed-point log2 (4 fractional bits) of a texel delta given with 7
+// fractional bits, as the hardware computes texture LOD. Same result as
+// taking the float exponent and the top 4 mantissa bits.
+inline s32 FixedLog2(u32 m) {
+  if (m == 0) return -2032;  // log2(0): smallest value, clamped by min LOD
+  s32 p = 31 - __builtin_clz(m);
+  u32 frac = ((m << (31 - p)) >> 27) & 0xF;
+  return (p - 7) * 16 + (s32)frac;
 }
 
 }  // namespace
 
-void ComputeLOD(u32 texmap, float dsdx, float dsdy, float dtdx, float dtdy, s32& lod, bool& linear) {
+void ComputeLOD(u32 texmap, s32 dsdx, s32 dsdy, s32 dtdx, s32 dtdy, s32& lod, bool& linear) {
   u32 mode0 = g_bp[TexReg(0x80, texmap)], mode1 = g_bp[TexReg(0x84, texmap)];
-  float s_delta, t_delta;
+  u32 asx = (u32)std::abs(dsdx), asy = (u32)std::abs(dsdy), atx = (u32)std::abs(dtdx), aty = (u32)std::abs(dtdy);
+  u32 s_delta, t_delta;
   if (Bits(mode0, 8, 1)) {  // diagonal LOD
-    s_delta = std::fabs(dsdx) + std::fabs(dsdy);
-    t_delta = std::fabs(dtdx) + std::fabs(dtdy);
+    s_delta = asx + asy;
+    t_delta = atx + aty;
   } else {
-    s_delta = std::max(std::fabs(dsdx), std::fabs(dsdy));
-    t_delta = std::max(std::fabs(dtdx), std::fabs(dtdy));
+    s_delta = std::max(asx, asy);
+    t_delta = std::max(atx, aty);
   }
   s32 l = FixedLog2(std::max(s_delta, t_delta));
   s32 bias = (s32)(s8)Bits(mode0, 9, 8);
@@ -518,90 +521,149 @@ void LoadSwapTables() {
 namespace {
 
 // Everything a worker needs to rasterize one triangle (read-only once queued).
+// Attribute plane in 16.16 fixed point: value at the centre of pixel (x, y)
+// is (c + dx * x + dy * y) >> 16. Integer only, so no float<->int
+// conversions per pixel (very slow on the Xenon: load-hit-store stalls).
+struct FixedPlane {
+  s64 c, dx, dy;
+};
+
+FixedPlane MakeFixedPlane(const Slope& s) {
+  FixedPlane p;
+  double c = (double)s.f0 + (double)s.dfdx * (0.5 - (double)s.x0) + (double)s.dfdy * (0.5 - (double)s.y0);
+  p.c = (s64)std::llround(c * 65536.0);
+  p.dx = (s64)std::llround((double)s.dfdx * 65536.0);
+  p.dy = (s64)std::llround((double)s.dfdy * 65536.0);
+  return p;
+}
+
 struct TriSetup {
   int minx, maxx, miny, maxy;
   s64 C1, C2, C3;
   s32 DX12, DX23, DX31, DY12, DY23, DY31;
   bool flip;
-  Slope z, w, color[2][4], tex[8][3];
+  FixedPlane z, color[2][4];
+  Slope w, tex[8][3];
 };
 
 std::vector<TriSetup> s_batch;  // triangles of the current draw call
 u64 s_batch_area = 0;
 u32 s_iref;
 
-void RasterizeTriangle(const TriSetup& t, int task, int tasks, u32& pixels) {
-  auto inside = [&](int x, int y) {
-    s64 px = (s64)x << 4, py = (s64)y << 4;
-    s64 e1 = t.C1 + t.DX12 * py - t.DY12 * px;
-    s64 e2 = t.C2 + t.DX23 * py - t.DY23 * px;
-    s64 e3 = t.C3 + t.DX31 * py - t.DY31 * px;
-    if (t.flip) return e1 < 0 && e2 < 0 && e3 < 0;
-    return e1 > 0 && e2 > 0 && e3 > 0;
-  };
+constexpr int SPAN = 8;  // perspective-correct texture coordinates every SPAN pixels
 
+// Texel coordinates (7 fractional bits) of texgen c at pixel centre (x, y),
+// perspective correct.
+inline void EvalUV(const TriSetup& t, int x, int y, s32 out[8][2]) {
+  float cx = (float)x + 0.5f, cy = (float)y + 0.5f;
+  float inv_w = 1.0f / t.w.At(cx, cy);
+  for (u32 c = 0; c < s_num_texgens; c++) {
+    float proj = inv_w;
+    float q = t.tex[c][2].At(cx, cy) * inv_w;
+    if (q != 0.0f) proj = inv_w / q;
+    out[c][0] = (s32)(t.tex[c][0].At(cx, cy) * proj * 128.0f);
+    out[c][1] = (s32)(t.tex[c][1].At(cx, cy) * proj * 128.0f);
+  }
+}
+
+inline u8 PlaneU8(const FixedPlane& p, s64 x, s64 y) {
+  s64 v = (p.c + p.dx * x + p.dy * y) >> 16;
+  return (u8)(v < 0 ? 0 : (v > 255 ? 255 : v));
+}
+
+void RasterizeTriangle(const TriSetup& t, int task, int tasks, u32& pixels) {
   PixelInput px;
   memset(&px, 0, sizeof(px));  // unused color channels read as zero
+  const u32 texgens = s_num_texgens, chans = std::min<u32>(s_num_chans, 2);
+  // Edge steps for one pixel (coordinates are 28.4 fixed point)
+  const s64 e1x = -(s64)t.DY12 * 16, e2x = -(s64)t.DY23 * 16, e3x = -(s64)t.DY31 * 16;
+  const s64 e1y = (s64)t.DX12 * 16, e2y = (s64)t.DX23 * 16, e3y = (s64)t.DX31 * 16;
+  const int x_start = t.minx & ~1;
+
   // Process 2x2 blocks so texture LOD can use screen-space derivatives.
   // Block rows are interleaved between workers, which therefore never touch
   // the same EFB pixels.
   for (int by = t.miny & ~1; by < t.maxy; by += 2) {
     if (tasks > 1 && ((by >> 1) % tasks) != task) continue;
-    for (int bx = t.minx & ~1; bx < t.maxx; bx += 2) {
+    // Edge values at (x_start, by)
+    s64 px0 = (s64)x_start << 4, py0 = (s64)by << 4;
+    s64 e1 = t.C1 + t.DX12 * py0 - t.DY12 * px0;
+    s64 e2 = t.C2 + t.DX23 * py0 - t.DY23 * px0;
+    s64 e3 = t.C3 + t.DX31 * py0 - t.DY31 * px0;
+
+    s32 uv_l[2][8][2], uv_r[2][8][2];  // span ends, rows by and by+1
+    int span_x = -1000000;
+    s32 span_recip = 0;  // 65536 / span length
+
+    for (int bx = x_start; bx < t.maxx; bx += 2, e1 += 2 * e1x, e2 += 2 * e2x, e3 += 2 * e3x) {
       bool cover[2][2];
       bool any = false;
       for (int j = 0; j < 2; j++)
         for (int i = 0; i < 2; i++) {
           int x = bx + i, y = by + j;
-          cover[i][j] = x >= t.minx && x < t.maxx && y >= t.miny && y < t.maxy && inside(x, y);
+          s64 f1 = e1 + i * e1x + j * e1y, f2 = e2 + i * e2x + j * e2y, f3 = e3 + i * e3x + j * e3y;
+          bool in = t.flip ? (f1 < 0 && f2 < 0 && f3 < 0) : (f1 > 0 && f2 > 0 && f3 > 0);
+          cover[i][j] = in && x >= t.minx && x < t.maxx && y >= t.miny && y < t.maxy;
           any |= cover[i][j];
         }
       if (!any) continue;
 
-      // Perspective-correct texture coordinates for the block
-      float uv[2][2][8][2];
-      for (int j = 0; j < 2; j++)
-        for (int i = 0; i < 2; i++) {
-          float cx = bx + i + 0.5f, cy = by + j + 0.5f;
-          float inv_w = 1.0f / t.w.At(cx, cy);
-          for (u32 c = 0; c < s_num_texgens; c++) {
-            float proj = inv_w;
-            float q = t.tex[c][2].At(cx, cy) * inv_w;
-            if (q != 0.0f) proj = inv_w / q;
-            uv[i][j][c][0] = t.tex[c][0].At(cx, cy) * proj;
-            uv[i][j][c][1] = t.tex[c][1].At(cx, cy) * proj;
+      // Texture coordinates of the block, interpolated within SPAN-pixel spans
+      s32 uv[2][2][8][2];
+      if (texgens) {
+        if (bx >= span_x + SPAN || bx < span_x) {
+          // Exact values at both ends of the span (kept inside the bounding
+          // box: w can be meaningless far outside the triangle).
+          span_x = bx;
+          int n = std::min(SPAN, std::max(1, t.maxx - 1 - span_x));
+          span_recip = 65536 / n;
+          for (int j = 0; j < 2; j++) {
+            int y = std::min(by + j, t.maxy - 1);
+            EvalUV(t, span_x, y, uv_l[j]);
+            EvalUV(t, span_x + n, y, uv_r[j]);
           }
         }
-      // LOD per TEV stage / indirect stage
-      for (u32 st = 0; st <= s_num_stages; st++) {
-        const StageConfig& cfg = s_stage[st];
-        if (!cfg.tex_enable) continue;
-        u32 tc = cfg.texcoord;
-        ComputeLOD(cfg.texmap, uv[0][0][tc][0] - uv[1][0][tc][0], uv[0][0][tc][0] - uv[0][1][tc][0],
-                   uv[0][0][tc][1] - uv[1][0][tc][1], uv[0][0][tc][1] - uv[0][1][tc][1], px.lod[st], px.linear[st]);
-      }
-      for (u32 st = 0; st < s_num_ind; st++) {
-        u32 map = Bits(s_iref, st * 6, 3), tc = Bits(s_iref, st * 6 + 3, 3);
-        if (tc >= s_num_texgens) tc = 0;
-        ComputeLOD(map, uv[0][0][tc][0] - uv[1][0][tc][0], uv[0][0][tc][0] - uv[0][1][tc][0],
-                   uv[0][0][tc][1] - uv[1][0][tc][1], uv[0][0][tc][1] - uv[0][1][tc][1], px.ind_lod[st],
-                   px.ind_linear[st]);
+        int k0 = bx - span_x;
+        for (int j = 0; j < 2; j++)
+          for (int i = 0; i < 2; i++) {
+            s64 f = (s64)(k0 + i) * span_recip;  // position in the span, 16.16
+            for (u32 c = 0; c < texgens; c++)
+              for (int a = 0; a < 2; a++) {
+                s32 l = uv_l[j][c][a], r = uv_r[j][c][a];
+                uv[i][j][c][a] = l + (s32)(((s64)(r - l) * f) >> 16);
+              }
+          }
+        // LOD per TEV stage / indirect stage
+        for (u32 st = 0; st <= s_num_stages; st++) {
+          const StageConfig& cfg = s_stage[st];
+          if (!cfg.tex_enable) continue;
+          u32 tc = cfg.texcoord;
+          ComputeLOD(cfg.texmap, uv[0][0][tc][0] - uv[1][0][tc][0], uv[0][0][tc][0] - uv[0][1][tc][0],
+                     uv[0][0][tc][1] - uv[1][0][tc][1], uv[0][0][tc][1] - uv[0][1][tc][1], px.lod[st],
+                     px.linear[st]);
+        }
+        for (u32 st = 0; st < s_num_ind; st++) {
+          u32 map = Bits(s_iref, st * 6, 3), tc = Bits(s_iref, st * 6 + 3, 3);
+          if (tc >= texgens) tc = 0;
+          ComputeLOD(map, uv[0][0][tc][0] - uv[1][0][tc][0], uv[0][0][tc][0] - uv[0][1][tc][0],
+                     uv[0][0][tc][1] - uv[1][0][tc][1], uv[0][0][tc][1] - uv[0][1][tc][1], px.ind_lod[st],
+                     px.ind_linear[st]);
+        }
       }
 
       for (int j = 0; j < 2; j++)
         for (int i = 0; i < 2; i++) {
           if (!cover[i][j]) continue;
           int x = bx + i, y = by + j;
-          float cx = x + 0.5f, cy = y + 0.5f;
           px.x = x;
           px.y = y;
-          px.z = (u32)std::clamp(t.z.At(cx, cy), 0.0f, 16777215.0f);
-          for (u32 c = 0; c < std::min<u32>(s_num_chans, 2); c++)
-            for (int k = 0; k < 4; k++)
-              px.color[c][k] = (u8)std::clamp(t.color[c][k].At(cx, cy), 0.0f, 255.0f);
-          for (u32 c = 0; c < s_num_texgens; c++) {
-            px.uv[c][0] = (s32)(uv[i][j][c][0] * 128.0f);
-            px.uv[c][1] = (s32)(uv[i][j][c][1] * 128.0f);
+          s64 z = (t.z.c + t.z.dx * x + t.z.dy * y) >> 16;
+          px.z = (u32)(z < 0 ? 0 : (z > 0xFFFFFF ? 0xFFFFFF : z));
+          for (u32 c = 0; c < chans; c++)
+            for (int k = 0; k < 4; k++) px.color[c][k] = PlaneU8(t.color[c][k], x, y);
+          for (u32 c = 0; c < texgens; c++) {
+            px.uv[c][0] = uv[i][j][c][0];
+            px.uv[c][1] = uv[i][j][c][1];
           }
           if (ShadePixel(px)) pixels++;
         }
@@ -700,11 +762,12 @@ void DrawTriangle(const OutputVertex* v0, const OutputVertex* v1, const OutputVe
   ctx.det = ctx.dx20 * ctx.dy10 - ctx.dx10 * ctx.dy20;
   if (ctx.det == 0.0f) return;
 
-  t.z = MakeSlope(v0->screen.z, v1->screen.z, v2->screen.z, ctx);
+  t.z = MakeFixedPlane(MakeSlope(v0->screen.z, v1->screen.z, v2->screen.z, ctx));
   float w[3] = {1.0f / v0->proj[3], 1.0f / v1->proj[3], 1.0f / v2->proj[3]};
   t.w = MakeSlope(w[0], w[1], w[2], ctx);
   for (u32 c = 0; c < 2; c++)
-    for (int i = 0; i < 4; i++) t.color[c][i] = MakeSlope(v0->color[c][i], v1->color[c][i], v2->color[c][i], ctx);
+    for (int i = 0; i < 4; i++)
+      t.color[c][i] = MakeFixedPlane(MakeSlope(v0->color[c][i], v1->color[c][i], v2->color[c][i], ctx));
   for (u32 c = 0; c < s_num_texgens; c++) {
     t.tex[c][0] = MakeSlope(v0->texcoords[c].x * w[0], v1->texcoords[c].x * w[1], v2->texcoords[c].x * w[2], ctx);
     t.tex[c][1] = MakeSlope(v0->texcoords[c].y * w[0], v1->texcoords[c].y * w[1], v2->texcoords[c].y * w[2], ctx);

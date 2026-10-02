@@ -118,7 +118,8 @@ void UpdateScissor();
 
 // texture.cpp
 void SampleTexture(u32 texmap, s32 s, s32 t, s32 lod, bool linear, u8 out[4]);
-void ComputeLOD(u32 texmap, float dsdx, float dsdy, float dtdx, float dtdy, s32& lod, bool& linear);
+// Deltas of texel coordinates between neighbouring pixels, 7 fractional bits.
+void ComputeLOD(u32 texmap, s32 dsdx, s32 dsdy, s32 dtdx, s32 dtdy, s32& lod, bool& linear);
 void LoadTLUT(u32 value);
 void PreloadTMEM(u32 value);
 void TextureReset();
