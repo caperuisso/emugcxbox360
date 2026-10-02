@@ -56,6 +56,8 @@ u16 Read16(u32 off);
 void Write16(u32 off, u16 v);
 // Set by the VI when a field has been presented; cleared by System.
 extern bool g_field_done;
+// Leaves the VI enabled in NTSC or PAL like the IPL does before starting a game.
+void SetBootTVMode(bool pal);
 }  // namespace VI
 
 // Serial Interface (controllers)

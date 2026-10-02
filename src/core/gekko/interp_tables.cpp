@@ -2,6 +2,7 @@
 // Opcode dispatch tables, SPR access and the unknown-instruction handler.
 #include "core/coretiming.h"
 #include "core/gekko/interp_internal.h"
+#include "core/hle.h"
 #include "core/hw/hw.h"
 
 namespace Interpreter {
@@ -75,6 +76,7 @@ void Init() {
     s_sub_of_primary[s[0]] = s[1];
     Reg(T_PRIMARY, s[0], DispatchSub, "(group)");
   }
+  Reg(T_PRIMARY, 1, HLE::Execute, "hle");
   RegisterInteger();
   RegisterLoadStore();
   RegisterFloat();

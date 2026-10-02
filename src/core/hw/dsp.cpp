@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // DSP interface registers, ARAM + ARAM DMA, audio DMA, and the Audio Interface.
-// The DSP core is not emulated yet: mailboxes behave like an idle DSP.
+// The DSP microcodes themselves are high level emulated in dsp_hle.cpp.
 #include <cstdlib>
 #include <vector>
 
 #include "core/coretiming.h"
+#include "core/hw/dsp_hle.h"
 #include "core/hw/hw.h"
 #include "core/memory.h"
 #include "platform/platform.h"
@@ -29,14 +30,16 @@ enum : u16 {
 };
 
 u8* s_aram = nullptr;
-u16 s_csr;
-u32 s_mail_to_dsp, s_mail_from_dsp;
-bool s_mail_from_valid;
+u16 s_csr;  // bits outside DSPHLE::CONTROL_MASK
+u32 s_mail_to_dsp;
 u16 s_ar_size, s_ar_mode, s_ar_refresh;
 u32 s_ar_mm, s_ar_aram, s_ar_cnt;
 u32 s_aid_addr, s_aid_cur_addr;
 u16 s_aid_ctrl, s_aid_left;
 int s_aid_event = -1;
+int s_dsp_int_event = -1;
+int s_hle_event = -1;
+constexpr s64 HLE_UPDATE_CYCLES = CPU_CLOCK / 1000;
 std::vector<s16> s_audio;
 
 void UpdateInterrupt() {
@@ -88,18 +91,42 @@ void AudioDMACallback(u64, s64 late) {
   UpdateInterrupt();
   CoreTiming::ScheduleEvent(s_aid_event, (s64)AudioBlockCycles(blocks) - late);
 }
+
+void DSPInterruptCallback(u64, s64) {
+  s_csr |= CSR_DSPINT;
+  UpdateInterrupt();
+}
+
+void HLEUpdateCallback(u64, s64 late) {
+  DSPHLE::Update();
+  CoreTiming::ScheduleEvent(s_hle_event, HLE_UPDATE_CYCLES - late);
+}
 }  // namespace
+
+void GenerateDSPInterrupt(s64 cycles_into_future) {
+  if (cycles_into_future <= 0) {
+    s_csr |= CSR_DSPINT;
+    UpdateInterrupt();
+  } else {
+    CoreTiming::ScheduleEvent(s_dsp_int_event, cycles_into_future);
+  }
+}
 
 void Init() {
   if (!s_aram) s_aram = (u8*)calloc(1, ARAM_SIZE);
   s_aid_event = CoreTiming::RegisterEvent("Audio DMA", AudioDMACallback);
+  s_dsp_int_event = CoreTiming::RegisterEvent("DSP interrupt", DSPInterruptCallback);
+  s_hle_event = CoreTiming::RegisterEvent("DSP HLE update", HLEUpdateCallback);
 }
 
 void Reset() {
   memset(s_aram, 0, ARAM_SIZE);
   s_csr = 0;
-  s_mail_to_dsp = s_mail_from_dsp = 0;
-  s_mail_from_valid = false;
+  s_mail_to_dsp = 0;
+  DSPHLE::Reset();
+  CoreTiming::RemoveEvent(s_dsp_int_event);
+  CoreTiming::RemoveEvent(s_hle_event);
+  CoreTiming::ScheduleEvent(s_hle_event, HLE_UPDATE_CYCLES);
   s_ar_size = s_ar_mode = s_ar_refresh = 0;
   s_ar_mm = s_ar_aram = s_ar_cnt = 0;
   s_aid_addr = s_aid_cur_addr = 0;
@@ -110,13 +137,11 @@ void Reset() {
 
 u16 Read16(u32 off) {
   switch (off) {
-    case 0x00: return (u16)(s_mail_to_dsp >> 16) & 0x7FFF;  // DSP consumed it immediately
+    case 0x00: return (u16)(s_mail_to_dsp >> 16);  // MSB cleared once the DSP took it
     case 0x02: return (u16)s_mail_to_dsp;
-    case 0x04: return (u16)(s_mail_from_dsp >> 16) | (s_mail_from_valid ? 0x8000 : 0);
-    case 0x06:
-      s_mail_from_valid = false;
-      return (u16)s_mail_from_dsp;
-    case 0x0A: return s_csr;
+    case 0x04: return DSPHLE::ReadMailHigh();
+    case 0x06: return DSPHLE::ReadMailLow();
+    case 0x0A: return (s_csr & ~DSPHLE::CONTROL_MASK) | (DSPHLE::ReadControl() & DSPHLE::CONTROL_MASK);
     case 0x12: return s_ar_size;
     case 0x16: return s_ar_mode | 1;  // ARAM ready
     case 0x1A: return s_ar_refresh;
@@ -137,10 +162,20 @@ u16 Read16(u32 off) {
 void Write16(u32 off, u16 v) {
   switch (off) {
     case 0x00: s_mail_to_dsp = (s_mail_to_dsp & 0xFFFF) | ((u32)v << 16); break;
-    case 0x02: s_mail_to_dsp = (s_mail_to_dsp & 0xFFFF0000u) | v; break;
+    case 0x02:
+      s_mail_to_dsp = (s_mail_to_dsp & 0xFFFF0000u) | v;
+      DSPHLE::SendMail(s_mail_to_dsp);
+      s_mail_to_dsp &= 0x7FFFFFFF;  // the DSP has taken the mail
+      break;
     case 0x0A: {
+      DSPHLE::WriteControl(v);
+      if (v & CSR_RES) {
+        s_aid_ctrl = 0;  // reset also stops audio DMA
+        CoreTiming::RemoveEvent(s_aid_event);
+      }
+      // Interrupt status bits are write-one-to-clear; masks are latched.
       u16 cleared = s_csr & CSR_INT_BITS & ~(v & CSR_INT_BITS);
-      s_csr = (v & ~(CSR_INT_BITS | CSR_RES | CSR_DMA)) | cleared;  // reset completes instantly
+      s_csr = (v & ~(CSR_INT_BITS | DSPHLE::CONTROL_MASK | CSR_DMA)) | cleared;
       UpdateInterrupt();
       break;
     }

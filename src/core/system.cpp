@@ -5,6 +5,7 @@
 
 #include "core/coretiming.h"
 #include "core/gekko/cpu.h"
+#include "core/hle.h"
 #include "core/hw/hw.h"
 #include "core/loader/boot.h"
 #include "core/memory.h"
@@ -54,6 +55,7 @@ bool Boot(const std::string& path) {
   Mem::Clear();
   CPU::Reset();
   HW::Reset();
+  HLE::Clear();
   return Boot::BootFile(path);
 }
 

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "core/gekko/cpu.h"
+#include "core/hle.h"
 #include "core/system.h"
 
 namespace {
@@ -188,7 +189,9 @@ void Usage(const char* argv0) {
           "  --dump FILE.ppm   save the last frame on exit\n"
           "  --cpi N           cycles charged per instruction (default 1)\n"
           "  --unthrottled     do not limit speed to 60 fields/s\n"
-          "  --scale N         window scale (default 1)\n",
+          "  --scale N         window scale (default 1)\n"
+          "  --regs            print CPU registers on exit (debugging)\n"
+          "  --osreport ADDR   log calls to the guest OSReport at ADDR (debugging)\n",
           argv0);
 }
 
@@ -199,7 +202,8 @@ int main(int argc, char** argv) {
   std::string path, dump;
   long max_frames = -1;
   int scale = 1;
-  bool throttle = true;
+  bool throttle = true, dump_regs = false;
+  std::vector<u32> osreport_addrs;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     if (a == "--headless") host.headless = true;
@@ -208,6 +212,8 @@ int main(int argc, char** argv) {
     else if (a == "--cpi" && i + 1 < argc) CPU::g_cycles_per_instruction = (u32)atoi(argv[++i]);
     else if (a == "--unthrottled") throttle = false;
     else if (a == "--scale" && i + 1 < argc) scale = atoi(argv[++i]);
+    else if (a == "--regs") dump_regs = true;
+    else if (a == "--osreport" && i + 1 < argc) osreport_addrs.push_back((u32)strtoul(argv[++i], nullptr, 0));
     else if (a[0] == '-') { Usage(argv[0]); return 1; }
     else path = a;
   }
@@ -223,6 +229,7 @@ int main(int argc, char** argv) {
     host.Close();
     return 1;
   }
+  for (u32 addr : osreport_addrs) HLE::Patch(addr, HLE::OSReport, "OSReport");
 
   using clock = std::chrono::steady_clock;
   auto next = clock::now();
@@ -250,6 +257,11 @@ int main(int argc, char** argv) {
   }
 
   printf("Ran %ld fields, %llu presented, pc=%08x\n", frames, (unsigned long long)host.frames_presented, cpu.pc);
+  if (dump_regs) {
+    printf("lr=%08x ctr=%08x msr=%08x cr=%08x srr0=%08x srr1=%08x\n", LR, CTR, cpu.msr, cpu.cr,
+           cpu.spr[SPR_SRR0], cpu.spr[SPR_SRR1]);
+    for (int r = 0; r < 32; r++) printf("r%-2d=%08x%s", r, cpu.gpr[r], (r % 8 == 7) ? "\n" : " ");
+  }
   if (!dump.empty()) {
     if (host.DumpPPM(dump.c_str()))
       printf("Saved last frame to %s\n", dump.c_str());

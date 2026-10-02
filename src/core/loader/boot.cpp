@@ -63,7 +63,8 @@ void SetupIPLState() {
   Mem::PhysWrite32(0x2C, 0x00000003);  // console type: retail (latest)
   Mem::PhysWrite32(0x30, 0x00000000);  // arena low (OS computes it)
   Mem::PhysWrite32(0x34, 0x817FE8C0);  // arena high
-  Mem::PhysWrite32(0xCC, 0x00000000);  // TV mode NTSC
+  Mem::PhysWrite32(0xCC, 0x00000000);  // TV mode NTSC (discs override this from their region)
+  VI::SetBootTVMode(false);
   Mem::PhysWrite32(0xEC, 0x81800000);  // simulated memory top
   Mem::PhysWrite32(0xF0, Mem::MEM1_SIZE);
   Mem::PhysWrite32(0xF8, BUS_CLOCK);
@@ -171,7 +172,14 @@ bool BootFile(const std::string& path) {
     u8 disc_header[0x20];
     DI::ReadDisc(0, disc_header, sizeof(disc_header));
     memcpy(Mem::PhysPtr(0, 0x20), disc_header, 0x20);  // game ID etc. at 0x80000000
-    LOG("Boot: disc %.6s\n", (const char*)disc_header);
+    // The IPL boots in the TV standard of the disc's region; the SDK refuses to
+    // switch between NTSC and PAL later on. Region: bi2.bin + 0x18 (2 = PAL).
+    u8 region[4] = {};
+    DI::ReadDisc(0x458, region, 4);
+    bool pal = LoadBE32(region) == 2;
+    Mem::PhysWrite32(0xCC, pal ? 1 : 0);
+    VI::SetBootTVMode(pal);
+    LOG("Boot: disc %.6s (%s)\n", (const char*)disc_header, pal ? "PAL" : "NTSC");
     return RunApploader();
   }
 

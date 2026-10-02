@@ -155,7 +155,8 @@ void Init() { s_line_event = CoreTiming::RegisterEvent("VI line", LineCallback);
 void Reset() {
   memset(s_regs, 0, sizeof(s_regs));
   memset(s_di_status, 0, sizeof(s_di_status));
-  // NTSC 640x480 interlaced timings; scan-out stays disabled until the game enables it.
+  // NTSC 640x480 interlaced timings. Scan-out stays disabled until boot code
+  // calls SetBootTVMode, as the IPL would.
   s_regs[VTR >> 1] = (240 << 4) | 6;
   s_regs[DCR >> 1] = 0;
   s_regs[PICCONF >> 1] = (40 << 8) | 40;
@@ -163,6 +164,33 @@ void Reset() {
   g_field_done = false;
   CoreTiming::RemoveEvent(s_line_event);
   CoreTiming::ScheduleEvent(s_line_event, CyclesPerLine());
+}
+
+// Register state the IPL leaves behind (values from Dolphin's VideoInterface::Preset).
+// The SDK relies on it: VI mode changes are only applied from the retrace
+// interrupt handler, so DI0/DI1 must already be armed when the game starts.
+void SetBootTVMode(bool pal) {
+  auto set32 = [](u32 off, u32 v) {
+    s_regs[off >> 1] = (u16)(v >> 16);
+    s_regs[(off >> 1) + 1] = (u16)v;
+  };
+  s_regs[VTR >> 1] = 6;                       // EQU=6, ACV=0
+  s_regs[DCR >> 1] = 1 | (pal ? 0x100 : 0);   // enabled, interlaced, NTSC/PAL
+  set32(0x04, (71u << 24) | (105u << 16) | 429u);       // HTR0: HCS, HCE, HLW
+  set32(0x08, 64u | (162u << 7) | (373u << 17));        // HTR1: HSY, HBE640, HBS640
+  set32(0x0C, (5u << 16) | 502u);                       // VTO: PSB, PRB
+  set32(0x10, (4u << 16) | 503u);                       // VTE
+  set32(0x14, 12u | (520u << 5) | (12u << 16) | (520u << 21));  // BBOI
+  set32(0x18, 13u | (519u << 5) | (13u << 16) | (519u << 21));  // BBEI
+  set32(0x1C, 0);                                       // no framebuffer yet
+  set32(0x24, 0);
+  set32(DI0_HI, (1u << 28) | (263u << 16) | 430u);      // DI0: enabled, line 263
+  set32(DI0_HI + 4, (1u << 28) | (1u << 16) | 1u);      // DI1: enabled, line 1
+  set32(DI0_HI + 8, 0);
+  set32(DI0_HI + 12, 0);
+  s_regs[PICCONF >> 1] = (40 << 8) | 40;
+  memset(s_di_status, 0, sizeof(s_di_status));
+  UpdateInterrupt();
 }
 
 u16 Read16(u32 off) {

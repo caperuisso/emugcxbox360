@@ -99,6 +99,13 @@ void CopyEFB(u32 cmd) {
     u32 stride = (s_bp[0x4D] & 0x3FF) << 5;
     u32 width = (s_bp[0x4A] & 0x3FF) + 1;
     u32 height = ((s_bp[0x4A] >> 10) & 0x3FF) + 1;
+    // Vertical scaling (PAL games stretch 480 EFB lines to ~528 XFB lines).
+    u32 yscale = s_bp[0x4E] & 0x1FF;
+    if (yscale) {
+      float scale = ((cmd >> 10) & 1) ? 256.0f / yscale : yscale / 256.0f;
+      height = (u32)(1.0f + (height - 1) * scale);
+      if (height > 1024) height = 1024;
+    }
     u8 y, u, v;
     YUVFromARGB(s_efb_color, y, u, v);
     for (u32 row = 0; row < height; row++) {
