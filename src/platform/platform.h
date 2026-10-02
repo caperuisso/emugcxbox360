@@ -46,6 +46,8 @@ class Host {
   virtual void RunParallel(int tasks, void (*fn)(int task, int tasks, void* ctx), void* ctx) {
     for (int i = 0; i < tasks; i++) fn(i, tasks, ctx);
   }
+  // Called at boot milestones (diagnostics).
+  virtual void Checkpoint(const char* where) { (void)where; }
   // Raw memory card image for slot 0 (A) / 1 (B); empty string = no card.
   virtual std::string MemcardPath(int slot) { (void)slot; return std::string(); }
 };

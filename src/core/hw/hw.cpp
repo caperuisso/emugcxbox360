@@ -98,12 +98,16 @@ void Reset() {
   PI::Reset();
   VI::Reset();
   SI::Reset();
+  BootCheckpoint("PI/VI/SI reset");
   EXI::Reset();
+  BootCheckpoint("EXI reset (memory card)");
   DI::Reset();
   DSP::Reset();
+  BootCheckpoint("DSP reset");
   AI::Reset();
   MI::Reset();
   GX::Reset();
+  BootCheckpoint("GX/Video reset");
 }
 
 void DoState(StateBuffer& s) {

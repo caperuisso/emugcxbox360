@@ -57,5 +57,8 @@ constexpr u32 TB_DIVIDER = 12;        // timebase ticks = bus/4 = cpu/12
 
 class StateBuffer;  // save states (core/state.h)
 
+// Boot progress markers (used by frontends for diagnostics; no-op by default).
+void BootCheckpoint(const char* where);
+
 void LogPrint(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 #define LOG(...) LogPrint(__VA_ARGS__)

@@ -25,6 +25,10 @@ void LogPrint(const char* fmt, ...) {
     fputs(buf, stderr);
 }
 
+void BootCheckpoint(const char* where) {
+  if (g_host) g_host->Checkpoint(where);
+}
+
 namespace System {
 
 namespace {
@@ -34,13 +38,17 @@ bool s_initialized = false;
 bool Init(Host* host) {
   g_host = host;
   if (s_initialized) return true;
+  BootCheckpoint("System::Init");
   if (!Mem::Init()) {
     LOG("System: out of memory\n");
     return false;
   }
+  BootCheckpoint("Mem::Init");
   CoreTiming::Init();
   CPU::Init();
+  BootCheckpoint("CPU::Init");
   HW::Init();
+  BootCheckpoint("HW::Init");
   s_initialized = true;
   return true;
 }
@@ -54,8 +62,11 @@ void Shutdown() {
 bool Boot(const std::string& path) {
   CoreTiming::Init();
   Mem::Clear();
+  BootCheckpoint("Mem::Clear");
   CPU::Reset();
+  BootCheckpoint("CPU::Reset");
   HW::Reset();
+  BootCheckpoint("HW::Reset");
   HLE::Clear();
   return Boot::BootFile(path);
 }

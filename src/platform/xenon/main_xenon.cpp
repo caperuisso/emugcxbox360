@@ -74,6 +74,36 @@ bool StartWorkers() {
   return g_worker_count > 1;
 }
 
+// ---- Code integrity diagnostics ----
+// Keeps a copy of the program's code and, at each boot checkpoint, reports
+// whether anything has overwritten it (and stops so the screen can be read).
+extern "C" u32 pagetable_end[], _text_end[];  // code after the vectors/page table
+u32* g_text_copy = nullptr;
+u32 g_text_words = 0;
+
+void SnapshotText() {
+  g_text_words = (u32)(_text_end - pagetable_end);
+  g_text_copy = (u32*)malloc(g_text_words * 4);
+  if (g_text_copy) memcpy(g_text_copy, pagetable_end, g_text_words * 4);
+}
+
+void CheckText(const char* where) {
+  if (!g_text_copy) return;
+  for (u32 i = 0; i < g_text_words; i++) {
+    if (pagetable_end[i] != g_text_copy[i]) {
+      u32 count = 0, first = i;
+      for (u32 k = i; k < g_text_words; k++)
+        if (pagetable_end[k] != g_text_copy[k]) count++;
+      printf("\n!!! CODE OVERWRITTEN before checkpoint '%s'\n", where);
+      printf("!!! first word %p: %08x -> %08x, %u words changed\n", (void*)&pagetable_end[first],
+             (unsigned)g_text_copy[first], (unsigned)pagetable_end[first], (unsigned)count);
+      printf("!!! please take a photo of this screen\n");
+      for (;;) mdelay(1000);
+    }
+  }
+  printf("[check] %s: code OK\n", where);
+}
+
 // Layout of the Xenos scan-out registers (see libxenon console.c).
 struct ATIInfo {
   uint32_t unknown1[4];
@@ -108,6 +138,7 @@ class XenonHost : public Host {
   }
 
   void Log(const char* msg) override { printf("%s", msg); }
+  void Checkpoint(const char* where) override { CheckText(where); }
 
   int ParallelWorkers() override { return g_worker_count; }
   void RunParallel(int tasks, void (*fn)(int, int, void*), void* ctx) override {
@@ -336,6 +367,7 @@ static void RunGlobalConstructors() {
 
 int main() {
   RunGlobalConstructors();
+  SnapshotText();
   xenos_init(VIDEO_MODE_AUTO);
   console_init();
   xenon_make_it_faster(XENON_SPEED_FULL);
@@ -348,7 +380,9 @@ int main() {
   printf("emugcxbox360 - GameCube emulator (milestone 1: interpreter, XFB only)\n");
 
   static XenonHost host;
+  CheckText("libxenon init");
   std::string game = PickGame();
+  CheckText("game picker");
   if (game.empty()) return 0;
 
   if (g_use_threads) StartWorkers();

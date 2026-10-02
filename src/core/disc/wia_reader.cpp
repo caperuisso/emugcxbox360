@@ -95,9 +95,11 @@ class WIAReader : public DiscReader {
     if (m_chunk_size < SECTOR_SIZE) return Fail(error, "invalid chunk size");
     if (m_compression == COMPRESSION_ZSTD && !(m_dctx = ZSTD_createDCtx())) return Fail(error, "out of memory");
 
+    BootCheckpoint("RVZ header read");
     // Raw data table: { u64 offset, u64 size, u32 group_index, u32 n_groups }
     std::vector<u8> raw(n_raw * 24);
     if (!ReadTable(raw_off, raw_size, raw)) return Fail(error, "corrupt raw data table");
+    BootCheckpoint("RVZ raw table decompressed");
     for (u32 i = 0; i < n_raw; i++) {
       const u8* r = &raw[i * 24];
       RawData rd;
@@ -113,7 +115,9 @@ class WIAReader : public DiscReader {
     // Group table: WIA { u32 off4, u32 size }, RVZ adds { u32 packed_size }
     u32 entry = m_rvz ? 12 : 8;
     std::vector<u8> groups(n_groups * entry);
+    BootCheckpoint("RVZ before group table");
     if (!ReadTable(group_off, group_size, groups)) return Fail(error, "corrupt group table");
+    BootCheckpoint("RVZ group table decompressed");
     for (u32 i = 0; i < n_groups; i++) {
       const u8* g = &groups[i * entry];
       Group gr;

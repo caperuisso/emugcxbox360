@@ -20,8 +20,8 @@ CSOURCES := third_party/zstd/zstddeclib.c
 OBJECTS  := $(patsubst %.cpp,$(BUILD)/%.o,$(SOURCES)) $(patsubst %.c,$(BUILD)/%.o,$(CSOURCES))
 DEPS     := $(OBJECTS:.o=.d)
 
-CXXFLAGS := -O2 -mcpu=cell -mtune=cell -fno-strict-aliasing -std=gnu++17 -Wall -Wno-unused-parameter $(MACHDEP) -Isrc -Ithird_party -I$(LIBXENON_INC)
-CFLAGS   := -O2 -mcpu=cell -mtune=cell $(MACHDEP)
+CXXFLAGS := -O2 -fno-strict-aliasing -std=gnu++17 -Wall -Wno-unused-parameter $(MACHDEP) -Isrc -Ithird_party -I$(LIBXENON_INC)
+CFLAGS   := -O2 $(MACHDEP)
 LDFLAGS  := $(MACHDEP) -Wl,--gc-sections -L$(LIBXENON_LIB)
 LIBS     := -lxenon -lfat -lm
 

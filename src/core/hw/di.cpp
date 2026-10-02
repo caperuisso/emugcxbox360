@@ -103,7 +103,9 @@ void DoState(StateBuffer& s) {
 bool OpenDisc(const std::string& path) {
   CloseDisc();
   std::string error;
+  BootCheckpoint("DI::OpenDisc");
   s_disc = OpenDiscImage(path, &error);
+  BootCheckpoint("disc image opened");
   if (!s_disc) {
     LOG("DI: cannot open %s: %s\n", path.c_str(), error.c_str());
     return false;

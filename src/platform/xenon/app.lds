@@ -3,7 +3,7 @@ ENTRY(_start)
 SECTIONS
 {
 	. = 0x80000000;
-	.text : {  *(.except*); *(.pagetable); pagetable_end = .; *(.init) *(.init.*); *(.fini*); *(.text*); }
+	.text : {  _text_start = .; *(.except*); *(.pagetable); pagetable_end = .; *(.init) *(.init.*); *(.fini*); *(.text*); _text_end = .; }
 	.elfldr : { elfldr_start = .;*(.elfldr); elfldr_end = .;}
 	
 	.data : { *(.data*) }
