@@ -13,10 +13,12 @@ include $(DEVKITXENON)/rules
 TARGET   := emugcxbox360
 BUILD    := build-xenon
 SOURCES  := $(wildcard src/core/*.cpp src/core/*/*.cpp) src/platform/xenon/main_xenon.cpp
-OBJECTS  := $(patsubst %.cpp,$(BUILD)/%.o,$(SOURCES))
+CSOURCES := third_party/zstd/zstddeclib.c
+OBJECTS  := $(patsubst %.cpp,$(BUILD)/%.o,$(SOURCES)) $(patsubst %.c,$(BUILD)/%.o,$(CSOURCES))
 DEPS     := $(OBJECTS:.o=.d)
 
-CXXFLAGS := -O2 -std=gnu++17 -Wall -Wno-unused-parameter $(MACHDEP) -Isrc -I$(LIBXENON_INC)
+CXXFLAGS := -O2 -std=gnu++17 -Wall -Wno-unused-parameter $(MACHDEP) -Isrc -Ithird_party -I$(LIBXENON_INC)
+CFLAGS   := -O2 $(MACHDEP)
 LDFLAGS  := $(MACHDEP) -Wl,--gc-sections -L$(LIBXENON_LIB)
 LIBS     := -lxenon -lfat -lm
 
@@ -27,6 +29,11 @@ $(BUILD)/%.o: %.cpp
 	@mkdir -p $(dir $@)
 	@echo [$(notdir $<)]
 	@$(CXX) -MMD -MP $(CXXFLAGS) -c $< -o $@
+
+$(BUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo [$(notdir $<)]
+	@$(CC) -MMD -MP $(CFLAGS) -c $< -o $@
 
 $(TARGET).elf: $(OBJECTS)
 	@echo linking ... $@

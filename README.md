@@ -15,10 +15,10 @@ Licence : GPL-2.0-or-later. Le code est écrit pour ce projet en s'appuyant sur 
 | PI / MI | Contrôleur d'interruptions, FIFO CPU |
 | SI | Manette standard (type, origine, poll direct et polling automatique) |
 | EXI | IPL : RTC + SRAM ; pas encore de carte mémoire |
-| DI | Lecture disque (ISO/GCM), inquiry, interruptions |
+| DI | Lecture disque, inquiry, interruptions. Formats : ISO/GCM, RVZ et WIA de Dolphin (zstd ou sans compression ; GameCube uniquement) |
 | DSP / ARAM / AI | ARAM 16 Mo + DMA, DMA audio vers l'hôte, compteur d'échantillons AI. **Le DSP lui-même n'est pas émulé** (mailboxes inertes) |
 | GX (CP/PE) | Parseur du FIFO (tailles de vertex, display lists, registres BP), tokens et draw-done, copie EFB→XFB à la couleur d'effacement. **Pas encore de rendu 3D** |
-| Boot | DOL direct ; ISO/GCM via apploader émulé (HLE de l'IPL, pas de BIOS requis) |
+| Boot | DOL direct ; ISO/GCM/RVZ/WIA via apploader émulé (HLE de l'IPL, pas de BIOS requis) |
 
 Concrètement, les homebrews qui dessinent directement dans l'XFB (console libogc, démos 2D logicielles) peuvent tourner. Les jeux commerciaux bootent leur code mais n'affichent rien tant que le rendu GX (jalon 2) et le DSP (jalon 3) manquent.
 
@@ -33,6 +33,14 @@ cmake -B build && cmake --build build -j
 python3 tests/make_test_dol.py build/test.dol
 ./build/emugc build/test.dol        # barres de couleur ; X = bouton A, flèches = stick
 ```
+
+Pour vérifier une image disque (format, ID du jeu, CRC32/SHA-1 à comparer avec redump.org, conversion optionnelle en ISO) :
+
+```bash
+./build/emugc_disctool jeu.rvz [sortie.iso]
+```
+
+Les RVZ compressés en bzip2/LZMA (option non standard de Dolphin) ne sont pas gérés : reconvertis-les en zstd ou en ISO avec `dolphin-tool convert`.
 
 Options : `--headless`, `--frames N`, `--dump image.ppm`, `--cpi N` (cycles par instruction), `--unthrottled`, `--scale N`.
 
@@ -57,7 +65,7 @@ Clavier → manette GameCube : X=A, Z=B, C=X, S=Y, Entrée=Start, D=Z, Q/W=L/R, 
    export PATH=$PATH:$DEVKITXENON/bin:$DEVKITXENON/usr/bin
    make -f Makefile.xenon
    ```
-3. Copier `emugcxbox360.elf32` sur une clé USB (FAT32) avec tes `.dol`/`.iso`/`.gcm` à la racine ou dans `/gc/`, puis lancer l'elf depuis XeLL.
+3. Copier `emugcxbox360.elf32` sur une clé USB (FAT32) avec tes `.dol`/`.iso`/`.gcm`/`.rvz` à la racine ou dans `/gc/`, puis lancer l'elf depuis XeLL.
 
 Sur la 360 : stick/croix pour choisir, A pour lancer, bouton Guide pour revenir à XeLL. Mapping en jeu : A=A, X=B, B=X, Y=Y, RB=Z, gâchettes=L/R.
 
@@ -72,7 +80,9 @@ src/core/            cœur portable (aucune dépendance plateforme)
   coretiming.*       ordonnanceur d'événements en cycles CPU
   system.*           API utilisée par les frontends
 src/platform/        platform.h (interface Host), sdl/ (PC), xenon/ (Xbox 360)
-tests/               tests unitaires CPU + générateur de DOL de test
+  disc/              lecteurs d'images : ISO, WIA/RVZ (zstd + padding RVZ)
+third_party/zstd/    décodeur Zstandard 1.5.6 (fichier unique, licence BSD)
+tests/               tests unitaires CPU, générateurs de DOL de test, emugc_disctool
 ```
 
 ## Feuille de route

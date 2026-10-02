@@ -126,7 +126,7 @@ bool HasGameExtension(const std::string& name) {
     size_t n = strlen(s);
     return l.size() >= n && l.compare(l.size() - n, n, s) == 0;
   };
-  return ends(".dol") || ends(".iso") || ends(".gcm");
+  return ends(".dol") || ends(".iso") || ends(".gcm") || ends(".rvz") || ends(".wia");
 }
 
 void ScanDir(const std::string& dir, std::vector<std::string>& out) {
@@ -150,7 +150,7 @@ std::string PickGame() {
     ScanDir(root + "gc/", games);
   }
   if (games.empty()) {
-    printf("\nNo .dol/.iso/.gcm found. Put games in the root or in /gc/ of a USB drive.\n");
+    printf("\nNo .dol/.iso/.gcm/.rvz found. Put games in the root or in /gc/ of a USB drive.\n");
     return "";
   }
 
@@ -205,7 +205,9 @@ int main() {
     printf("Failed to boot %s\n", game.c_str());
     for (;;) mdelay(1000);
   }
-  console_close();  // the emulated picture owns the framebuffer from now on
+  console_set_colors(0, 0);
+  console_clrscr();  // black screen: no leftover text around the emulated picture
+  console_close();   // the emulated picture owns the framebuffer from now on
 
   for (;;) {
     usb_do_poll();

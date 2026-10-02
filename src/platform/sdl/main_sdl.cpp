@@ -182,7 +182,7 @@ class SDLHost : public Host {
 
 void Usage(const char* argv0) {
   fprintf(stderr,
-          "usage: %s [options] <game.dol|game.iso|game.gcm>\n"
+          "usage: %s [options] <game.dol|game.iso|game.gcm|game.rvz>\n"
           "  --headless        no window (for tests)\n"
           "  --frames N        quit after N fields\n"
           "  --dump FILE.ppm   save the last frame on exit\n"

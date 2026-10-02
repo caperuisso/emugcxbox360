@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Video Interface: beam counter, display interrupts and XFB scan-out.
+#include <algorithm>
 #include <vector>
 
 #include "core/coretiming.h"
@@ -79,6 +80,13 @@ void PresentXFB() {
   u32 top = FrameBufferAddr(TFBL_HI), bottom = FrameBufferAddr(BFBL_HI);
 
   s_frame.resize((size_t)width * height);
+  // Until the game enables the VI and points it at a framebuffer, show black
+  // rather than scanning out whatever sits at physical address 0.
+  if (!(R(DCR) & 1) || top == 0) {
+    std::fill(s_frame.begin(), s_frame.end(), 0xFF000000u);
+    g_host->PresentFrame(s_frame.data(), (int)width, (int)height);
+    return;
+  }
   for (u32 y = 0; y < height; y++) {
     u32 line_addr;
     if (interlaced)
@@ -147,9 +155,9 @@ void Init() { s_line_event = CoreTiming::RegisterEvent("VI line", LineCallback);
 void Reset() {
   memset(s_regs, 0, sizeof(s_regs));
   memset(s_di_status, 0, sizeof(s_di_status));
-  // Sensible NTSC 640x480 interlaced defaults, as left behind by the IPL.
+  // NTSC 640x480 interlaced timings; scan-out stays disabled until the game enables it.
   s_regs[VTR >> 1] = (240 << 4) | 6;
-  s_regs[DCR >> 1] = 1;
+  s_regs[DCR >> 1] = 0;
   s_regs[PICCONF >> 1] = (40 << 8) | 40;
   s_line = 1;
   g_field_done = false;

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdio>
 
+#include "core/disc/disc_reader.h"
 #include "core/gekko/cpu.h"
 #include "core/hw/hw.h"
 #include "core/memory.h"
@@ -162,7 +163,7 @@ bool BootFile(const std::string& path) {
     return true;
   }
 
-  if (EndsWith(lower, ".iso") || EndsWith(lower, ".gcm")) {
+  if (IsDiscImagePath(lower)) {
     if (!DI::OpenDisc(path)) {
       LOG("Boot: cannot open disc %s\n", path.c_str());
       return false;

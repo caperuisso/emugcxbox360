@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // DVD Interface: high level emulation of the drive commands games use,
 // backed by a raw GCM/ISO image.
-#include <cstdio>
-
+#include "core/disc/disc_reader.h"
 #include "core/hw/hw.h"
 #include "core/memory.h"
 
@@ -20,8 +19,7 @@ enum : u32 {
   CVR_CVRINT = 1 << 2,
 };
 
-FILE* s_disc = nullptr;
-u64 s_disc_size = 0;
+std::unique_ptr<DiscReader> s_disc;
 u32 s_sr, s_cvr, s_cmd[3], s_mar, s_length, s_cr, s_immbuf, s_cfg;
 u32 s_error;
 
@@ -88,26 +86,25 @@ void Reset() {
 
 bool OpenDisc(const std::string& path) {
   CloseDisc();
-  s_disc = fopen(path.c_str(), "rb");
-  if (!s_disc) return false;
-  fseek(s_disc, 0, SEEK_END);
-  s_disc_size = (u64)ftell(s_disc);
+  std::string error;
+  s_disc = OpenDiscImage(path, &error);
+  if (!s_disc) {
+    LOG("DI: cannot open %s: %s\n", path.c_str(), error.c_str());
+    return false;
+  }
+  LOG("DI: %s image, %llu bytes\n", s_disc->FormatName(), (unsigned long long)s_disc->Size());
   s_cvr = 0;
   return true;
 }
 
 void CloseDisc() {
-  if (s_disc) fclose(s_disc);
-  s_disc = nullptr;
-  s_disc_size = 0;
+  s_disc.reset();
 }
 
 bool HasDisc() { return s_disc != nullptr; }
 
 bool ReadDisc(u64 offset, void* dst, u32 len) {
-  if (!s_disc || offset + len > s_disc_size) return false;
-  if (fseek(s_disc, (long)offset, SEEK_SET) != 0) return false;
-  return fread(dst, 1, len, s_disc) == len;
+  return s_disc && s_disc->Read(offset, dst, len);
 }
 
 u32 Read32(u32 off) {
