@@ -1,0 +1,38 @@
+# emugcxbox360 - Xbox 360 build (libxenon toolchain)
+#   export DEVKITXENON=$HOME/xenon
+#   export PATH=$PATH:$DEVKITXENON/bin:$DEVKITXENON/usr/bin
+#   make -f Makefile.xenon
+# Produces emugcxbox360.elf32, bootable from XeLL (USB, network or CD).
+
+ifeq ($(strip $(DEVKITXENON)),)
+$(error "Set DEVKITXENON to your libxenon toolchain prefix, e.g. export DEVKITXENON=$$HOME/xenon")
+endif
+
+include $(DEVKITXENON)/rules
+
+TARGET   := emugcxbox360
+BUILD    := build-xenon
+SOURCES  := $(wildcard src/core/*.cpp src/core/*/*.cpp) src/platform/xenon/main_xenon.cpp
+OBJECTS  := $(patsubst %.cpp,$(BUILD)/%.o,$(SOURCES))
+DEPS     := $(OBJECTS:.o=.d)
+
+CXXFLAGS := -O2 -std=gnu++17 -Wall -Wno-unused-parameter $(MACHDEP) -Isrc -I$(LIBXENON_INC)
+LDFLAGS  := $(MACHDEP) -Wl,--gc-sections -L$(LIBXENON_LIB)
+LIBS     := -lxenon -lfat -lm
+
+.PHONY: all clean
+all: $(TARGET).elf32
+
+$(BUILD)/%.o: %.cpp
+	@mkdir -p $(dir $@)
+	@echo [$(notdir $<)]
+	@$(CXX) -MMD -MP $(CXXFLAGS) -c $< -o $@
+
+$(TARGET).elf: $(OBJECTS)
+	@echo linking ... $@
+	@$(CXX) $(OBJECTS) $(LDFLAGS) $(LIBS) -n -T $(LDSCRIPT) -o $@
+
+clean:
+	rm -rf $(BUILD) $(TARGET).elf $(TARGET).elf32
+
+-include $(DEPS)

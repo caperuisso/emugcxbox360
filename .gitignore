@@ -1,0 +1,8 @@
+build/
+build-xenon/
+*.elf
+*.elf32
+*.dol
+*.iso
+*.gcm
+*.ppm
