@@ -7,3 +7,4 @@ build-xenon/
 *.gcm
 *.ppm
 build_ppc/
+build_prof/
