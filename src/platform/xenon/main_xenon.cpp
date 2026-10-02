@@ -25,6 +25,7 @@ int bdev_enum(int handle, const char** name);
 }
 
 #include "core/memory.h"
+#include "platform/xenon/xenos_gpu.h"
 #include "core/system.h"
 
 namespace {
@@ -216,7 +217,13 @@ class XenonHost : public Host {
     return memcard_dir + "memcard_a.raw";
   }
 
+  bool gpu = false;  // draw through the Xenos GPU instead of writing the framebuffer
+
   void PresentFrame(const u32* argb, int w, int h) override {
+    if (gpu) {
+      XenosGpu::Present(argb, w, h, overlay);
+      return;
+    }
     if (!fb || w <= 0 || h <= 0) return;
     // Fit the image to the screen height, keeping the 4:3 aspect, centred.
     int dst_h = fb_h;
@@ -332,6 +339,7 @@ void ScanDir(const std::string& dir, std::vector<std::string>& out) {
 
 // Simple file picker drawn with the libxenon text console.
 bool g_use_threads = false;
+bool g_use_gpu = true;
 
 std::string PickGame() {
   std::vector<std::string> games;
@@ -351,8 +359,8 @@ std::string PickGame() {
   for (;;) {
     if (sel != shown) {
       console_clrscr();
-      printf("emugcxbox360 - choose a game (A: start, X: multi-thread renderer %s, Guide: quit)\n\n",
-             g_use_threads ? "ON" : "OFF");
+      printf("emugcxbox360 - choose a game (A: start, X: multi-thread renderer %s, Y: GPU display %s, Guide: quit)\n\n",
+             g_use_threads ? "ON" : "OFF", g_use_gpu ? "ON" : "OFF");
       int first = std::max(0, sel - 10);
       for (int i = first; i < (int)games.size() && i < first + 20; i++)
         printf("%s %s\n", i == sel ? ">" : " ", games[i].c_str());
@@ -370,6 +378,12 @@ std::string PickGame() {
       shown = -1;  // redraw
     }
     x_was_down = c.x;
+    static bool y_was_down = false;
+    if (c.y && !y_was_down) {
+      g_use_gpu = !g_use_gpu;
+      shown = -1;
+    }
+    y_was_down = c.y;
     bool down = c.down || c.s1_y < -20000, up = c.up || c.s1_y > 20000;
     if ((down || up) && repeat-- <= 0) {
       sel = std::clamp(sel + (down ? 1 : -1), 0, (int)games.size() - 1);
@@ -436,6 +450,7 @@ int main() {
   console_set_colors(0, 0);
   console_clrscr();  // black screen: no leftover text around the emulated picture
   console_close();   // the emulated picture owns the framebuffer from now on
+  if (g_use_gpu) host.gpu = XenosGpu::Init();
 
   u64 stats_start = mftb();
   int stats_fields = 0;
