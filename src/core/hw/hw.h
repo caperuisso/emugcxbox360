@@ -70,6 +70,7 @@ void UpdatePolling();  // called once per field
 
 // External Interface (memory cards, IPL/RTC/SRAM)
 namespace EXI {
+void Init();
 void Reset();
 u32 Read32(u32 off);
 void Write32(u32 off, u32 v);

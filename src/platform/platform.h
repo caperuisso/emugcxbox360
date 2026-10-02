@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
+#include <string>
+
 #include "core/common.h"
 
 // GameCube pad buttons (same bit layout as libogc PAD_BUTTON_*)
@@ -38,6 +40,8 @@ class Host {
   virtual void PollPad(int port, PadState& out) = 0;
   // Interleaved stereo s16 samples (host endianness)
   virtual void PushAudio(const s16* samples, int frames, int rate) { (void)samples; (void)frames; (void)rate; }
+  // Raw memory card image for slot 0 (A) / 1 (B); empty string = no card.
+  virtual std::string MemcardPath(int slot) { (void)slot; return std::string(); }
 };
 
 extern Host* g_host;

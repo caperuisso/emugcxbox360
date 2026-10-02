@@ -1,6 +1,7 @@
 // emugcxbox360 - SDL2 frontend for Linux/PC (development and testing host)
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include <SDL.h>
+#include <sys/stat.h>
 
 #include <chrono>
 #include <cstdio>
@@ -16,8 +17,61 @@
 
 namespace {
 
+// Scripted input: "frame:buttons:duration,..." e.g. "1000:start:10,1200:a+down:5"
+struct ScriptedPress {
+  long frame, duration;
+  u16 buttons;
+};
+
+u16 ParseButtons(const std::string& s) {
+  u16 b = 0;
+  size_t pos = 0;
+  while (pos <= s.size()) {
+    size_t end = s.find('+', pos);
+    std::string name = s.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+    if (name == "a") b |= PAD_A;
+    else if (name == "b") b |= PAD_B;
+    else if (name == "x") b |= PAD_X;
+    else if (name == "y") b |= PAD_Y;
+    else if (name == "start") b |= PAD_START;
+    else if (name == "z") b |= PAD_Z;
+    else if (name == "l") b |= PAD_L;
+    else if (name == "r") b |= PAD_R;
+    else if (name == "up") b |= PAD_UP;
+    else if (name == "down") b |= PAD_DOWN;
+    else if (name == "left") b |= PAD_LEFT;
+    else if (name == "right") b |= PAD_RIGHT;
+    else fprintf(stderr, "unknown button '%s'\n", name.c_str());
+    if (end == std::string::npos) break;
+    pos = end + 1;
+  }
+  return b;
+}
+
+std::vector<ScriptedPress> ParseScript(const std::string& spec) {
+  std::vector<ScriptedPress> out;
+  size_t pos = 0;
+  while (pos < spec.size()) {
+    size_t end = spec.find(',', pos);
+    std::string item = spec.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+    size_t c1 = item.find(':'), c2 = item.find(':', c1 + 1);
+    if (c1 != std::string::npos) {
+      ScriptedPress p;
+      p.frame = atol(item.substr(0, c1).c_str());
+      p.buttons = ParseButtons(item.substr(c1 + 1, c2 == std::string::npos ? std::string::npos : c2 - c1 - 1));
+      p.duration = c2 == std::string::npos ? 5 : atol(item.substr(c2 + 1).c_str());
+      out.push_back(p);
+    }
+    if (end == std::string::npos) break;
+    pos = end + 1;
+  }
+  return out;
+}
+
 class SDLHost : public Host {
  public:
+  std::vector<ScriptedPress> script;
+  long current_frame = 0;
   bool headless = false;
   SDL_Window* window = nullptr;
   SDL_Renderer* renderer = nullptr;
@@ -60,6 +114,16 @@ class SDLHost : public Host {
 
   void Log(const char* msg) override { fputs(msg, stdout); fflush(stdout); }
 
+  std::string memcard_path;  // empty: default location; "none": no card
+  std::string MemcardPath(int slot) override {
+    if (slot != 0 || memcard_path == "none") return std::string();
+    if (!memcard_path.empty()) return memcard_path;
+    const char* home = getenv("HOME");
+    std::string dir = std::string(home ? home : ".") + "/.emugcxbox360";
+    mkdir(dir.c_str(), 0755);
+    return dir + "/memcard_a.raw";
+  }
+
   void PresentFrame(const u32* argb, int w, int h) override {
     frames_presented++;
     last_frame.assign(argb, argb + (size_t)w * h);
@@ -81,6 +145,8 @@ class SDLHost : public Host {
   void PollPad(int port, PadState& out) override {
     if (port != 0) return;  // only port 1 is wired for now
     out.connected = true;
+    for (const ScriptedPress& p : script)
+      if (current_frame >= p.frame && current_frame < p.frame + p.duration) out.buttons |= p.buttons;
     if (headless) return;
     const Uint8* k = SDL_GetKeyboardState(nullptr);
     auto key = [&](SDL_Scancode s) { return k[s] != 0; };
@@ -193,7 +259,10 @@ void Usage(const char* argv0) {
           "  --scale N         window scale (default 1)\n"
           "  --regs            print CPU registers on exit (debugging)\n"
           "  --osreport ADDR   log calls to the guest OSReport at ADDR (debugging)\n"
-          "  --stats           print GPU statistics every 60 fields\n",
+          "  --stats           print GPU statistics every 60 fields\n"
+          "  --input SPEC      scripted pad input, e.g. 1000:start:10,1300:a:5\n"
+          "  --memcard FILE    memory card image for slot A (default ~/.emugcxbox360/memcard_a.raw, 'none' = no card)\n"
+          "  --dump-every N    with --dump, also save a frame every N fields (name_FRAME.ppm)\n",
           argv0);
 }
 
@@ -202,7 +271,7 @@ void Usage(const char* argv0) {
 int main(int argc, char** argv) {
   SDLHost host;
   std::string path, dump;
-  long max_frames = -1;
+  long max_frames = -1, dump_every = 0;
   int scale = 1;
   bool throttle = true, dump_regs = false, stats = false;
   std::vector<u32> osreport_addrs;
@@ -216,6 +285,9 @@ int main(int argc, char** argv) {
     else if (a == "--scale" && i + 1 < argc) scale = atoi(argv[++i]);
     else if (a == "--regs") dump_regs = true;
     else if (a == "--stats") stats = true;
+    else if (a == "--input" && i + 1 < argc) host.script = ParseScript(argv[++i]);
+    else if (a == "--memcard" && i + 1 < argc) host.memcard_path = argv[++i];
+    else if (a == "--dump-every" && i + 1 < argc) dump_every = atol(argv[++i]);
     else if (a == "--osreport" && i + 1 < argc) osreport_addrs.push_back((u32)strtoul(argv[++i], nullptr, 0));
     else if (a[0] == '-') { Usage(argv[0]); return 1; }
     else path = a;
@@ -240,8 +312,15 @@ int main(int argc, char** argv) {
   auto fps_start = clock::now();
   long frames = 0, fps_frames = 0;
   while (host.HandleEvents()) {
+    host.current_frame = frames;
     System::RunFrame();
     frames++;
+    if (dump_every > 0 && !dump.empty() && frames % dump_every == 0) {
+      std::string name = dump;
+      size_t dot = name.rfind('.');
+      name = name.substr(0, dot) + "_" + std::to_string(frames) + (dot == std::string::npos ? "" : name.substr(dot));
+      host.DumpPPM(name.c_str());
+    }
     fps_frames++;
     if (stats && frames % 60 == 0) {
       const Video::Stats& s = Video::g_stats;

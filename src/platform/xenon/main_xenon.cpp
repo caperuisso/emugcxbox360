@@ -60,6 +60,12 @@ class XenonHost : public Host {
 
   void Log(const char* msg) override { printf("%s", msg); }
 
+  std::string memcard_dir;  // e.g. "uda0:/gc/"
+  std::string MemcardPath(int slot) override {
+    if (slot != 0 || memcard_dir.empty()) return std::string();
+    return memcard_dir + "memcard_a.raw";
+  }
+
   void PresentFrame(const u32* argb, int w, int h) override {
     if (!fb || w <= 0 || h <= 0) return;
     // Fit the image to the screen height, keeping the 4:3 aspect, centred.
@@ -214,6 +220,7 @@ int main() {
   if (game.empty()) return 0;
 
   host.Attach();
+  host.memcard_dir = game.substr(0, game.rfind('/') + 1);  // card lives next to the game
   if (!System::Init(&host) || !System::Boot(game)) {
     printf("Failed to boot %s\n", game.c_str());
     for (;;) mdelay(1000);

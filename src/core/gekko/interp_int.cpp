@@ -114,11 +114,26 @@ void bx(u32 i) {
   u32 target = ((i & 2) ? 0 : cpu.pc) + li;
   if (i & 1) LR = cpu.pc + 4;
   cpu.npc = target;
+  if (target == cpu.pc && !(i & 1)) CPU::g_idle = true;  // "b ." spins until an interrupt
 }
+// Detects polling loops "lwz rX,d(rY); cmp(l)wi rX,imm; bc -8": nothing but an
+// interrupt or a hardware event can change the polled word, so the CPU can skip
+// ahead to the next scheduled event (idle skipping, as Dolphin does).
+void CheckIdleLoop(u32 target) {
+  if (target != cpu.pc - 8) return;
+  u32 load = Mem::ReadInstr(target);
+  u32 cmp = Mem::ReadInstr(target + 4);
+  u32 op_load = OPCD(load), op_cmp = OPCD(cmp);
+  if ((op_load == 32 || op_load == 34 || op_load == 40) && (op_cmp == 10 || op_cmp == 11) &&
+      RA(cmp) == RD(load) && RD(load) != RA(load))
+    CPU::g_idle = true;
+}
+
 void bcx(u32 i) {
   if (BranchCondition(RD(i), RA(i))) {
     u32 bd = (u32)(s32)(s16)(i & 0xFFFC);
     cpu.npc = ((i & 2) ? 0 : cpu.pc) + bd;
+    if ((s32)bd == -8) CheckIdleLoop(cpu.npc);
   }
   if (i & 1) LR = cpu.pc + 4;
 }

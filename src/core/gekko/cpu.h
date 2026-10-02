@@ -146,6 +146,9 @@ void SetDecrementer(u32 value);
 
 // Cycles charged per interpreted instruction (tunable speed hack).
 extern u32 g_cycles_per_instruction;
+// Set by the interpreter when it detects an idle polling loop.
+extern bool g_idle;
+extern bool g_idle_skipping;  // option, on by default
 
 }  // namespace CPU
 

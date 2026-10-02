@@ -9,6 +9,8 @@ CPUState cpu;
 namespace CPU {
 
 u32 g_cycles_per_instruction = 1;
+bool g_idle = false;
+bool g_idle_skipping = true;
 
 namespace {
 int s_dec_event = -1;
@@ -95,7 +97,13 @@ static inline void ExecuteOne() {
 void Run() {
   // Pending async interrupts may have become deliverable since the last slice.
   if (cpu.exceptions) CheckExceptions();
-  while (cpu.cycles < CoreTiming::g_slice_end) ExecuteOne();
+  while (cpu.cycles < CoreTiming::g_slice_end) {
+    ExecuteOne();
+    if (UNLIKELY(g_idle)) {
+      g_idle = false;
+      if (g_idle_skipping && cpu.cycles < CoreTiming::g_slice_end) cpu.cycles = CoreTiming::g_slice_end;
+    }
+  }
 }
 
 void Step() { ExecuteOne(); }

@@ -125,6 +125,14 @@ float FogFloat(u32 v) {
   return BitCast<float>(bits);
 }
 
+// TEV stage configuration decoded once per triangle
+struct StageConfig {
+  u32 texmap, texcoord, ras_chan, cc, ac, ind;
+  bool tex_enable;
+  S16x4 konst;
+};
+StageConfig s_stage[16];
+
 struct PixelInput {
   int x, y;
   u32 z;
@@ -174,19 +182,18 @@ void ShadePixel(const PixelInput& in) {
   u8 alpha_bump = 0;
 
   for (u32 stage = 0; stage <= s_num_stages; stage++) {
-    u32 order = g_bp[BP_TREF + (stage >> 1)];
-    u32 shift = (stage & 1) ? 12 : 0;
-    u32 texmap = Bits(order, shift, 3);
-    u32 texcoord = Bits(order, shift + 3, 3);
-    bool tex_enable = Bits(order, shift + 6, 1);
-    u32 ras_chan = Bits(order, shift + 7, 3);
-    if (texcoord >= s_num_texgens) texcoord = 0;
-    u32 cc = g_bp[BP_TEV_COLOR_ENV + stage * 2];
-    u32 ac = g_bp[BP_TEV_COLOR_ENV + stage * 2 + 1];
+    const StageConfig& cfg = s_stage[stage];
+    u32 texmap = cfg.texmap, texcoord = cfg.texcoord, ras_chan = cfg.ras_chan;
+    bool tex_enable = cfg.tex_enable;
+    u32 cc = cfg.cc, ac = cfg.ac;
 
     // Indirect stage: perturb texture coordinates
-    {
-      u32 ind = g_bp[BP_IND_CMD + stage];
+    if (cfg.ind == 0) {  // common case: no indirect texturing
+      tc_s = in.uv[texcoord][0];
+      tc_t = in.uv[texcoord][1];
+      alpha_bump = 0;
+    } else {
+      u32 ind = cfg.ind;
       s32 s = in.uv[texcoord][0], t = in.uv[texcoord][1];
       const u8* map = ind_tex[Bits(ind, 0, 2)];
       u32 fmt = Bits(ind, 2, 2), bs = Bits(ind, 7, 2);
@@ -272,11 +279,7 @@ void ShadePixel(const PixelInput& in) {
     }
 
     // Konstant
-    u32 ksel = g_bp[BP_TEV_KSEL + (stage >> 1)];
-    u32 kshift = (stage & 1) ? 14 : 4;
-    S16x4 kc = KonstColor(Bits(ksel, kshift, 5));
-    S16x4 ka = KonstColor(Bits(ksel, kshift + 5, 5));
-    S16x4 konst = {kc.r, kc.g, kc.b, ka.a};
+    const S16x4& konst = cfg.konst;
 
     // Gather inputs
     auto color_in = [&](u32 arg, int ch) -> s16 {
@@ -512,6 +515,24 @@ void DrawTriangle(const OutputVertex* v0, const OutputVertex* v1, const OutputVe
   s_num_stages = Bits(genmode, 10, 4);
   s_num_ind = Bits(genmode, 16, 3);
   LoadSwapTables();
+  for (u32 stage = 0; stage <= s_num_stages; stage++) {
+    StageConfig& c = s_stage[stage];
+    u32 order = g_bp[BP_TREF + (stage >> 1)];
+    u32 shift = (stage & 1) ? 12 : 0;
+    c.texmap = Bits(order, shift, 3);
+    c.texcoord = Bits(order, shift + 3, 3);
+    c.tex_enable = Bits(order, shift + 6, 1);
+    c.ras_chan = Bits(order, shift + 7, 3);
+    if (c.texcoord >= s_num_texgens) c.texcoord = 0;
+    c.cc = g_bp[BP_TEV_COLOR_ENV + stage * 2];
+    c.ac = g_bp[BP_TEV_COLOR_ENV + stage * 2 + 1];
+    c.ind = g_bp[BP_IND_CMD + stage] & 0x1FFFFF;
+    u32 ksel = g_bp[BP_TEV_KSEL + (stage >> 1)];
+    u32 kshift = (stage & 1) ? 14 : 4;
+    S16x4 kc = KonstColor(Bits(ksel, kshift, 5));
+    S16x4 ka = KonstColor(Bits(ksel, kshift + 5, 5));
+    c.konst = {kc.r, kc.g, kc.b, ka.a};
+  }
 
   // Screen -> EFB coordinates
   float xs[3] = {v0->screen.x - 342.0f - s_x_off, v1->screen.x - 342.0f - s_x_off, v2->screen.x - 342.0f - s_x_off};
@@ -574,6 +595,7 @@ void DrawTriangle(const OutputVertex* v0, const OutputVertex* v1, const OutputVe
 
   u32 iref = g_bp[BP_IREF];
   PixelInput px;
+  memset(&px, 0, sizeof(px));  // unused color channels read as zero
   // Process 2x2 blocks so texture LOD can use screen-space derivatives.
   for (int by = miny & ~1; by < maxy; by += 2) {
     for (int bx = minx & ~1; bx < maxx; bx += 2) {
@@ -627,7 +649,7 @@ void DrawTriangle(const OutputVertex* v0, const OutputVertex* v1, const OutputVe
           px.x = x;
           px.y = y;
           px.z = (u32)std::clamp(s_z.At(cx, cy), 0.0f, 16777215.0f);
-          for (u32 c = 0; c < 2; c++)
+          for (u32 c = 0; c < std::min<u32>(s_num_chans, 2); c++)
             for (int k = 0; k < 4; k++)
               px.color[c][k] = (u8)std::clamp(s_color[c][k].At(cx, cy), 0.0f, 255.0f);
           for (u32 t = 0; t < s_num_texgens; t++) {

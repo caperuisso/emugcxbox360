@@ -87,6 +87,7 @@ void Unmapped(const char* what, u32 pa) {
 
 void Init() {
   VI::Init();
+  EXI::Init();
   DSP::Init();
   AI::Init();
 }

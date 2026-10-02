@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// External Interface: three channels, with the IPL/RTC/SRAM device on channel 0.
-// Memory cards and other devices report "not connected" for now.
+// External Interface: three channels. Channel 0 has the memory card in slot A
+// (device 0) and the IPL/RTC/SRAM device (device 1).
 #include <ctime>
 
+#include "core/coretiming.h"
 #include "core/hw/hw.h"
+#include "core/hw/memcard.h"
 #include "core/memory.h"
+#include "platform/platform.h"
 
 namespace EXI {
 
@@ -79,9 +82,21 @@ struct IPLDevice {
 };
 IPLDevice s_ipl;
 
+MemoryCard* s_card_a = nullptr;  // allocated at runtime (no global constructors)
+int s_card_event = -1;
+
 void InitSRAM() {
   u8* s = s_ipl.sram;
   memset(s, 0, 64);
+  // Flash IDs of the memory cards last formatted on this console, and their
+  // checksums (the SDK checks a card's serial against them).
+  memcpy(s + 0x14, "EMUGCSLOTA\0\0", 12);
+  memcpy(s + 0x20, "EMUGCSLOTB\0\0", 12);
+  for (int slot = 0; slot < 2; slot++) {
+    u8 sum = 0;
+    for (int i = 0; i < 12; i++) sum += s[0x14 + slot * 12 + i];
+    s[0x3A + slot] = (u8)~sum;
+  }
   s[0x11] = 0x00;  // NTSC, non-progressive
   s[0x12] = 0x00;  // English
   s[0x13] = 0x2C;  // flags: stereo sound, settings initialised
@@ -104,8 +119,30 @@ int SelectedDevice(const Channel& c) {
 }
 
 bool HasIPL(int ch, int dev) { return ch == 0 && dev == 1; }
+bool HasCardA(int ch, int dev) { return ch == 0 && dev == 0 && s_card_a; }
 
-u8 Transfer(int ch, int dev, u8 in) { return HasIPL(ch, dev) ? s_ipl.TransferByte(in) : 0; }
+u8 Transfer(int ch, int dev, u8 in) {
+  if (HasIPL(ch, dev)) return s_ipl.TransferByte(in);
+  if (HasCardA(ch, dev)) return s_card_a->TransferByte(in);
+  return ch == 0 && dev == 0 ? 0xFF : 0;
+}
+
+void UpdateInterrupts();
+
+void ScheduleCardCompletion() {
+  if (!s_card_a) return;
+  s64 delay = s_card_a->TakePendingDelay();
+  if (delay > 0) CoreTiming::ScheduleEvent(s_card_event, delay);
+}
+
+void CardEventCallback(u64, s64) {
+  if (!s_card_a) return;
+  s_card_a->CommandDone();
+  if (s_card_a->TakeInterrupt()) {
+    s_ch[0].csr |= CSR_EXIINT;
+    UpdateInterrupts();
+  }
+}
 
 void UpdateInterrupts() {
   bool active = false;
@@ -149,10 +186,18 @@ void StartTransfer(int ch) {
 }
 }  // namespace
 
+void Init() { s_card_event = CoreTiming::RegisterEvent("Memcard", CardEventCallback); }
+
 void Reset() {
   memset(s_ch, 0, sizeof(s_ch));
   s_ipl = IPLDevice();
   InitSRAM();
+  if (!s_card_a) s_card_a = new MemoryCard();
+  std::string path = g_host ? g_host->MemcardPath(0) : std::string();
+  if (path.empty() || !s_card_a->Open(path, s_ipl.sram + 0x14)) {
+    delete s_card_a;
+    s_card_a = nullptr;
+  }
   UpdateInterrupts();
 }
 
@@ -161,7 +206,7 @@ u32 Read32(u32 off) {
   if (ch > 2) return 0;
   Channel& c = s_ch[ch];
   switch (off % 0x14) {
-    case 0x00: return c.csr;  // EXT bit stays 0: no memory card inserted
+    case 0x00: return c.csr | ((ch == 0 && s_card_a) ? (1u << 12) : 0);  // EXT: card present
     case 0x04: return c.mar;
     case 0x08: return c.length;
     case 0x0C: return c.cr;
@@ -178,9 +223,16 @@ void Write32(u32 off, u32 v) {
       int old_dev = SelectedDevice(c);
       u32 cleared = c.csr & ~(v & CSR_INT_BITS) & CSR_INT_BITS;
       c.csr = (v & ~CSR_INT_BITS) | cleared;
-      c.csr &= ~(1u << 12);  // EXT: nothing attached
+      c.csr &= ~(1u << 12);  // EXT is computed on read
       int new_dev = SelectedDevice(c);
-      if (old_dev != new_dev && HasIPL(ch, 1)) s_ipl.Deselect();
+      if (old_dev != new_dev && ch == 0) {
+        if (old_dev == 1 || new_dev == 1) s_ipl.Deselect();
+        if (s_card_a && old_dev == 0) {
+          s_card_a->Select(false);
+          ScheduleCardCompletion();
+        }
+        if (s_card_a && new_dev == 0) s_card_a->Select(true);
+      }
       UpdateInterrupts();
       break;
     }
