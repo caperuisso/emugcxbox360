@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "core/coretiming.h"
+#include "core/hw/ax_audio.h"
 #include "core/hw/zelda_audio.h"
 #include "core/memory.h"
 
@@ -275,34 +276,46 @@ class AXUCode : public UCode {
  private:
   enum class State { WaitingForCmdListSize, WaitingForCmdListAddress, WaitingForNextTask };
 
-  // Walks the command list with the right argument counts. Mixing is not
-  // implemented yet, so commands have no effect besides being consumed.
+  // Executes a command list (formats from Dolphin's AXUCode::HandleCommandList).
   void RunCommandList(u32 addr, u32 size) {
     u16 list[512];
+    auto hilo = [&](u32 i) { return ((u32)list[i] << 16) | list[i + 1]; };
     for (int guard = 0; guard < 64; guard++) {
       if (size > 512) return;
       const u8* p = Mem::PhysPtr(addr & 0x01FFFFFF, size * 2);
       if (!p) return;
       for (u32 i = 0; i < size; i++) list[i] = LoadBE16(p + i * 2);
-      u32 i = 0;
+      u32 i = 0, pb_addr = 0;
       bool more = false;
       while (i < size && !more) {
         u16 cmd = list[i++];
         switch (cmd) {
-          case 0x00: case 0x02: case 0x06: case 0x07: case 0x09: case 0x11: i += 2; break;
-          case 0x01: i += 5; break;
-          case 0x03: case 0x0A: case 0x0B: case 0x0C: break;
-          case 0x04: case 0x05: case 0x0E: case 0x10: i += 4; break;
-          case 0x08: i += 10; break;
-          case 0x12: i += 4; break;
-          case 0x13: i += 12; break;
+          case 0x00: m_mixer.SetupProcessing(hilo(i)); i += 2; break;
+          case 0x01: m_mixer.DownloadAndMixWithVolume(hilo(i), list[i + 2], list[i + 3], list[i + 4]); i += 5; break;
+          case 0x02: pb_addr = hilo(i); i += 2; break;
+          case 0x03: m_mixer.ProcessPBList(pb_addr); break;
+          case 0x04:
+          case 0x05: m_mixer.MixAUXSamples(cmd - 0x04, hilo(i), hilo(i + 2)); i += 4; break;
+          case 0x06: m_mixer.UploadLRS(hilo(i)); i += 2; break;
+          case 0x07: m_mixer.SetMainLR(hilo(i)); i += 2; break;
+          case 0x08: i += 10; break;  // unknown, unused
+          case 0x09: m_mixer.MixAUXSamples(1, 0, hilo(i)); i += 2; break;
+          case 0x0A: case 0x0B: case 0x0C: break;
           case 0x0D:  // continue with another list
             if (i + 3 > size) return;
-            addr = ((u32)list[i] << 16) | list[i + 1];
+            addr = hilo(i);
             size = list[i + 2];
             more = true;
             break;
+          case 0x0E: m_mixer.OutputSamples(hilo(i + 2), hilo(i)); i += 4; break;
           case 0x0F: return;  // end
+          case 0x10: m_mixer.MixAUXBLR(hilo(i), hilo(i + 2)); i += 4; break;
+          case 0x11: m_mixer.SetOppositeLR(hilo(i)); i += 2; break;
+          case 0x12: m_mixer.RunCompressor(list[i], list[i + 1], hilo(i + 2), 5); i += 4; break;
+          case 0x13:
+            m_mixer.SendAUXAndMix(hilo(i), hilo(i + 2), hilo(i + 4), hilo(i + 6), hilo(i + 8), hilo(i + 10));
+            i += 12;
+            break;
           default:
             LOG("DSP AX: unknown command %04x\n", cmd);
             return;
@@ -314,6 +327,7 @@ class AXUCode : public UCode {
 
   State m_state = State::WaitingForCmdListSize;
   u32 m_cmdlist_size = 0;
+  AXMixer m_mixer{m_crc};
 };
 
 // "Zelda"/DAC microcode used by many Nintendo EAD games (Wind Waker, Mario

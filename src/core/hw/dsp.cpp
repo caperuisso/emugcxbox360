@@ -81,7 +81,11 @@ void AudioDMACallback(u64, s64 late) {
   u32 bytes = blocks * 32;
   if (const u8* src = Mem::PhysPtr(s_aid_cur_addr, bytes)) {
     s_audio.resize(bytes / 2);
-    for (u32 k = 0; k < bytes / 2; k++) s_audio[k] = (s16)LoadBE16(src + k * 2);
+    // The audio interface receives right then left; hosts expect left first.
+    for (u32 k = 0; k < bytes / 2; k += 2) {
+      s_audio[k] = (s16)LoadBE16(src + k * 2 + 2);
+      s_audio[k + 1] = (s16)LoadBE16(src + k * 2);
+    }
     if (g_host) g_host->PushAudio(s_audio.data(), (int)(bytes / 4), (int)AI::GetDSPSampleRate());
   }
   // Block finished: raise AIDINT, hardware restarts from the programmed address.

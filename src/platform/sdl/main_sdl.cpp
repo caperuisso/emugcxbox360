@@ -21,9 +21,11 @@ namespace {
 struct ScriptedPress {
   long frame, duration;
   u16 buttons;
+  u8 stick_x = 0x80, stick_y = 0x80;
 };
 
-u16 ParseButtons(const std::string& s) {
+// Buttons: a b x y start z l r up down left right; main stick: sleft sright sup sdown
+u16 ParseButtons(const std::string& s, u8* sx = nullptr, u8* sy = nullptr) {
   u16 b = 0;
   size_t pos = 0;
   while (pos <= s.size()) {
@@ -41,6 +43,10 @@ u16 ParseButtons(const std::string& s) {
     else if (name == "down") b |= PAD_DOWN;
     else if (name == "left") b |= PAD_LEFT;
     else if (name == "right") b |= PAD_RIGHT;
+    else if (name == "sleft" && sx) *sx = 0x10;
+    else if (name == "sright" && sx) *sx = 0xF0;
+    else if (name == "sup" && sy) *sy = 0xF0;
+    else if (name == "sdown" && sy) *sy = 0x10;
     else fprintf(stderr, "unknown button '%s'\n", name.c_str());
     if (end == std::string::npos) break;
     pos = end + 1;
@@ -58,7 +64,8 @@ std::vector<ScriptedPress> ParseScript(const std::string& spec) {
     if (c1 != std::string::npos) {
       ScriptedPress p;
       p.frame = atol(item.substr(0, c1).c_str());
-      p.buttons = ParseButtons(item.substr(c1 + 1, c2 == std::string::npos ? std::string::npos : c2 - c1 - 1));
+      p.buttons = ParseButtons(item.substr(c1 + 1, c2 == std::string::npos ? std::string::npos : c2 - c1 - 1),
+                               &p.stick_x, &p.stick_y);
       p.duration = c2 == std::string::npos ? 5 : atol(item.substr(c2 + 1).c_str());
       out.push_back(p);
     }
@@ -146,7 +153,11 @@ class SDLHost : public Host {
     if (port != 0) return;  // only port 1 is wired for now
     out.connected = true;
     for (const ScriptedPress& p : script)
-      if (current_frame >= p.frame && current_frame < p.frame + p.duration) out.buttons |= p.buttons;
+      if (current_frame >= p.frame && current_frame < p.frame + p.duration) {
+        out.buttons |= p.buttons;
+        if (p.stick_x != 0x80) out.stick_x = p.stick_x;
+        if (p.stick_y != 0x80) out.stick_y = p.stick_y;
+      }
     if (headless) return;
     const Uint8* k = SDL_GetKeyboardState(nullptr);
     auto key = [&](SDL_Scancode s) { return k[s] != 0; };
