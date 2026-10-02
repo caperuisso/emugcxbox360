@@ -89,6 +89,8 @@ void Write32(u32 off, u32 v);
 
 // DSP interface, ARAM DMA and audio DMA (the DSP core itself is HLE'd later)
 namespace DSP {
+u8* ARAMPtr();
+u32 ARAMSize();
 void Init();
 void Reset();
 u16 Read16(u32 off);

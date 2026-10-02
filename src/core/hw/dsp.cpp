@@ -103,6 +103,9 @@ void HLEUpdateCallback(u64, s64 late) {
 }
 }  // namespace
 
+u8* ARAMPtr() { return s_aram; }
+u32 ARAMSize() { return ARAM_SIZE; }
+
 void GenerateDSPInterrupt(s64 cycles_into_future) {
   if (cycles_into_future <= 0) {
     s_csr |= CSR_DSPINT;

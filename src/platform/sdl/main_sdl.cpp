@@ -203,7 +203,36 @@ class SDLHost : public Host {
     }
   }
 
+  FILE* wav = nullptr;
+  u32 wav_bytes = 0;
+  int wav_rate = 0;
+
+  void WriteWavHeader() {
+    u8 h[44];
+    memcpy(h, "RIFF", 4);
+    u32 v = 36 + wav_bytes;
+    memcpy(h + 4, &v, 4);  // little-endian host
+    memcpy(h + 8, "WAVEfmt ", 8);
+    v = 16; memcpy(h + 16, &v, 4);
+    u16 s = 1; memcpy(h + 20, &s, 2);   // PCM
+    s = 2; memcpy(h + 22, &s, 2);       // stereo
+    v = (u32)wav_rate; memcpy(h + 24, &v, 4);
+    v = (u32)wav_rate * 4; memcpy(h + 28, &v, 4);
+    s = 4; memcpy(h + 32, &s, 2);
+    s = 16; memcpy(h + 34, &s, 2);
+    memcpy(h + 36, "data", 4);
+    memcpy(h + 40, &wav_bytes, 4);
+    fseek(wav, 0, SEEK_SET);
+    fwrite(h, 1, 44, wav);
+    fseek(wav, 0, SEEK_END);
+  }
+
   void PushAudio(const s16* samples, int frames, int rate) override {
+    if (wav) {
+      if (!wav_rate) wav_rate = rate;
+      fwrite(samples, 4, (size_t)frames, wav);
+      wav_bytes += (u32)frames * 4;
+    }
     if (headless) return;
     if (!audio || rate != audio_rate) {
       if (audio) SDL_CloseAudioDevice(audio);
@@ -261,6 +290,7 @@ void Usage(const char* argv0) {
           "  --osreport ADDR   log calls to the guest OSReport at ADDR (debugging)\n"
           "  --stats           print GPU statistics every 60 fields\n"
           "  --input SPEC      scripted pad input, e.g. 1000:start:10,1300:a:5\n"
+          "  --wav FILE        record the audio output to a WAV file\n"
           "  --memcard FILE    memory card image for slot A (default ~/.emugcxbox360/memcard_a.raw, 'none' = no card)\n"
           "  --dump-every N    with --dump, also save a frame every N fields (name_FRAME.ppm)\n",
           argv0);
@@ -287,6 +317,11 @@ int main(int argc, char** argv) {
     else if (a == "--stats") stats = true;
     else if (a == "--input" && i + 1 < argc) host.script = ParseScript(argv[++i]);
     else if (a == "--memcard" && i + 1 < argc) host.memcard_path = argv[++i];
+    else if (a == "--wav" && i + 1 < argc) {
+      host.wav = fopen(argv[++i], "wb");
+      static const u8 placeholder[44] = {};
+      if (host.wav) fwrite(placeholder, 1, sizeof(placeholder), host.wav);  // header written at exit
+    }
     else if (a == "--dump-every" && i + 1 < argc) dump_every = atol(argv[++i]);
     else if (a == "--osreport" && i + 1 < argc) osreport_addrs.push_back((u32)strtoul(argv[++i], nullptr, 0));
     else if (a[0] == '-') { Usage(argv[0]); return 1; }
@@ -355,6 +390,11 @@ int main(int argc, char** argv) {
       printf("Saved last frame to %s\n", dump.c_str());
     else
       printf("No frame to save\n");
+  }
+  if (host.wav) {
+    host.WriteWavHeader();
+    fclose(host.wav);
+    printf("Recorded %u bytes of audio at %d Hz\n", host.wav_bytes, host.wav_rate);
   }
   System::Shutdown();
   host.Close();

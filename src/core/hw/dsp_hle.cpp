@@ -4,10 +4,12 @@
 // so games run, and produce silence.
 #include "core/hw/dsp_hle.h"
 
+#include <algorithm>
 #include <memory>
 #include <utility>
 
 #include "core/coretiming.h"
+#include "core/hw/zelda_audio.h"
 #include "core/memory.h"
 
 namespace DSPHLE {
@@ -319,7 +321,11 @@ class AXUCode : public UCode {
 class ZeldaUCode : public UCode {
  public:
   enum Flags : u32 {
+    MAKE_DOLBY_LOUDER = 0x2,
     LIGHT_PROTOCOL = 0x4,
+    FOUR_MIXING_DESTS = 0x8,
+    TINY_VPB = 0x10,
+    VOLUME_EXPLICIT_STEP = 0x20,
     SYNC_PER_FRAME = 0x40,
     NO_CMD_0D = 0x80,
     SUPPORTS_GBA_CRYPTO = 0x100,
@@ -327,7 +333,10 @@ class ZeldaUCode : public UCode {
     COMBINED_CMD_0D = 0x400,
   };
 
-  ZeldaUCode(u32 crc, u32 flags) : UCode(crc), m_flags(flags) {}
+  ZeldaUCode(u32 crc, u32 flags) : UCode(crc), m_flags(flags) {
+    m_renderer.SetFlags(flags & (MAKE_DOLBY_LOUDER | FOUR_MIXING_DESTS | TINY_VPB | VOLUME_EXPLICIT_STEP));
+    for (auto& f : m_skip_flags) f = 0;
+  }
   const char* Name() const override { return "Zelda"; }
 
   void Initialize() override {
@@ -387,12 +396,16 @@ class ZeldaUCode : public UCode {
         break;
       case MailState::Rendering:
         if (m_flags & SYNC_PER_FRAME) {
+          int base = m_sync_second_half ? 2 : 0;
+          m_skip_flags[base] = (u16)(mail >> 16);
+          m_skip_flags[base + 1] = (u16)mail;
           if (m_sync_second_half) m_sync_max_voice = 0xFFFF;
           RenderAudio();
           if (m_sync_second_half) m_mail_state = MailState::Waiting;
           m_sync_second_half = !m_sync_second_half;
         } else {
           m_sync_max_voice = (((mail >> 16) & 0xF) + 1) << 4;
+          m_skip_flags[(mail >> 16) & 0xFF] = (u16)mail;
           RenderAudio();
           m_mail_state = MailState::Waiting;
         }
@@ -441,6 +454,7 @@ class ZeldaUCode : public UCode {
         break;
       case MailState::Rendering:
         m_sync_max_voice = 0xFFFFFFFF;
+        for (auto& f : m_skip_flags) f = 0xFFFF;
         RenderAudio();
         DSP::GenerateDSPInterrupt();
         break;
@@ -475,16 +489,18 @@ class ZeldaUCode : public UCode {
           return;
         case 0x01:  // setup: VPB base, coefficient tables, AFC table, reverb PBs
           m_voices_per_frame = cmd_mail & 0xFFFF;
-          Read32();
-          Read32();
-          Read32();
-          Read32();
+          {
+            u32 vpb = Read32(), coeffs = Read32(), afc = Read32(), reverb = Read32();
+            m_renderer.Setup(vpb, coeffs, afc, reverb, !(m_flags & LIGHT_PROTOCOL));
+          }
           SendAck(false, sync);
           break;
         case 0x02:  // render frames
           m_requested_frames = (cmd_mail >> 16) & 0xFF;
-          Read32();  // left buffer
-          Read32();  // right buffer
+          {
+            u32 left = Read32(), right = Read32();
+            m_renderer.SetOutput((u16)cmd_mail, left, right);
+          }
           if (m_flags & COMBINED_CMD_0D) {
             Read32();
             Read32();
@@ -530,18 +546,21 @@ class ZeldaUCode : public UCode {
     if (!done_rendering) PushMail(0xF3550000 | sync);
   }
 
-  // Silent rendering: advances through the requested frames with the same
-  // synchronisation mails as the real microcode.
+  // Renders the requested frames voice by voice, waiting for the CPU's sync
+  // mails between groups of voices like the real microcode.
   void RenderAudio() {
     if (!RenderingInProgress()) return;
     while (m_curr_frame < m_requested_frames) {
-      if (m_voices_per_frame > 0 && m_curr_voice < m_voices_per_frame) {
-        if (m_sync_max_voice < m_voices_per_frame) {
-          m_curr_voice = m_sync_max_voice;
-          return;  // wait for the next sync mail
-        }
+      if (m_curr_voice == 0) m_renderer.PrepareFrame();
+      u32 voices = std::min<u32>(m_voices_per_frame, 256u * 16u);
+      while (m_curr_voice < voices) {
+        if (m_curr_voice >= m_sync_max_voice) return;  // wait for the next sync mail
+        u16 flags = m_skip_flags[m_curr_voice >> 4];
+        if (flags & (1u << (15 - (m_curr_voice & 0xF)))) m_renderer.AddVoice((u16)m_curr_voice);
+        m_curr_voice++;
       }
       if (!(m_flags & LIGHT_PROTOCOL)) SendAck(false, (u16)(0xFF00 | m_curr_frame));
+      m_renderer.FinalizeFrame();
       m_curr_voice = 0;
       m_sync_max_voice = 0;
       m_curr_frame++;
@@ -565,6 +584,8 @@ class ZeldaUCode : public UCode {
   u32 m_voices_per_frame = 0, m_curr_voice = 0;
   u32 m_sync_max_voice = 0;
   bool m_sync_second_half = false;
+  u16 m_skip_flags[256];
+  ZeldaAudioRenderer m_renderer;
 };
 
 std::unique_ptr<UCode> CreateUCode(u32 crc) {
@@ -575,16 +596,23 @@ std::unique_ptr<UCode> CreateUCode(u32 crc) {
     case 0xDD7E72D5: return std::make_unique<GBAUCode>(crc);
 
     // Zelda family, with per-version protocol flags (from Dolphin)
-    case 0x24B22038: return std::make_unique<ZeldaUCode>(crc, ZeldaUCode::LIGHT_PROTOCOL | ZeldaUCode::NO_CMD_0D | ZeldaUCode::WEIRD_CMD_0C);
-    case 0x6BA3B3EA: return std::make_unique<ZeldaUCode>(crc, ZeldaUCode::LIGHT_PROTOCOL | ZeldaUCode::NO_CMD_0D);
+    case 0x24B22038:
+      return std::make_unique<ZeldaUCode>(crc, ZeldaUCode::LIGHT_PROTOCOL | ZeldaUCode::FOUR_MIXING_DESTS |
+                                                   ZeldaUCode::TINY_VPB | ZeldaUCode::VOLUME_EXPLICIT_STEP |
+                                                   ZeldaUCode::NO_CMD_0D | ZeldaUCode::WEIRD_CMD_0C);
+    case 0x6BA3B3EA:
+      return std::make_unique<ZeldaUCode>(crc, ZeldaUCode::LIGHT_PROTOCOL | ZeldaUCode::FOUR_MIXING_DESTS |
+                                                   ZeldaUCode::NO_CMD_0D);
     case 0xDF059F68:
     case 0x4BE6A5CB: return std::make_unique<ZeldaUCode>(crc, ZeldaUCode::LIGHT_PROTOCOL | ZeldaUCode::NO_CMD_0D | ZeldaUCode::SUPPORTS_GBA_CRYPTO);
     case 0x42F64AC4: return std::make_unique<ZeldaUCode>(crc, ZeldaUCode::LIGHT_PROTOCOL | ZeldaUCode::NO_CMD_0D | ZeldaUCode::WEIRD_CMD_0C);
     case 0x267FD05A:
     case 0x56D36052: return std::make_unique<ZeldaUCode>(crc, ZeldaUCode::SYNC_PER_FRAME | ZeldaUCode::NO_CMD_0D);
     case 0x86840740:  // Wind Waker
-    case 0x2FCDF1EC: return std::make_unique<ZeldaUCode>(crc, 0);
-    case 0x6CA33A6D: return std::make_unique<ZeldaUCode>(crc, ZeldaUCode::COMBINED_CMD_0D);
+      return std::make_unique<ZeldaUCode>(crc, 0);
+    case 0x2FCDF1EC: return std::make_unique<ZeldaUCode>(crc, ZeldaUCode::MAKE_DOLBY_LOUDER);
+    case 0x6CA33A6D:
+      return std::make_unique<ZeldaUCode>(crc, ZeldaUCode::MAKE_DOLBY_LOUDER | ZeldaUCode::COMBINED_CMD_0D);
 
     default:
       // Every other retail microcode is a variant of AX (Dolphin does the same).
