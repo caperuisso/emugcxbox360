@@ -3,7 +3,12 @@ ENTRY(_start)
 SECTIONS
 {
 	. = 0x80000000;
-	.text : {  _text_start = .; *(.except*); *(.pagetable); pagetable_end = .; *(.init) *(.init.*); *(.fini*); *(.text*); _text_end = .; }
+	.text : {  _text_start = .; *(.except*); *(.pagetable); pagetable_end = .;
+		/* Keep the low physical memory free of code: on hardware something rewrites
+		   the cache line at 0x3bf00 during disc reads (see main_xenon.cpp). */
+		*libxenon.a:cache.o(.text*)
+		low_hole_start = .; . = 0x80000; /* offset in .text = 0x80080000 */ low_hole_end = .;
+		*(.init) *(.init.*); *(.fini*); *(.text*); _text_end = .; }
 	.elfldr : { elfldr_start = .;*(.elfldr); elfldr_end = .;}
 	
 	.data : { *(.data*) }

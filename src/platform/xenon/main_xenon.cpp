@@ -77,14 +77,14 @@ bool StartWorkers() {
 // ---- Code integrity diagnostics ----
 // Keeps a copy of the program's code and, at each boot checkpoint, reports
 // whether anything has overwritten it (and stops so the screen can be read).
-extern "C" u32 pagetable_end[], _text_end[];  // code after the vectors/page table
+extern "C" u32 low_hole_start[], low_hole_end[], _text_end[];  // unused low memory, code
 u32* g_text_copy = nullptr;
 u32 g_text_words = 0;
 
 void SnapshotText() {
-  g_text_words = (u32)(_text_end - pagetable_end);
+  g_text_words = (u32)(_text_end - low_hole_end);
   g_text_copy = (u32*)malloc(g_text_words * 4);
-  if (g_text_copy) memcpy(g_text_copy, pagetable_end, g_text_words * 4);
+  if (g_text_copy) memcpy(g_text_copy, low_hole_end, g_text_words * 4);
 }
 
 // Compares the code with the startup copy. Overwritten words are reported and
@@ -92,26 +92,38 @@ void SnapshotText() {
 // tells which operation preceded the damage.
 u32 g_repairs = 0;
 
+// The hole below the code is never used: report whatever lands there.
+void WatchHole(const char* where) {
+  static u32 reports = 0;
+  for (u32* w = low_hole_start; w < low_hole_end; w++) {
+    if (LIKELY(*w == 0)) continue;
+    if (reports++ < 16)
+      printf("[guard] low memory %p written after '%s' (value %08x)\n", (void*)w, where, (unsigned)*w);
+    *w = 0;
+  }
+}
+
 bool GuardText(const char* where) {
+  WatchHole(where);
   if (!g_text_copy) return true;
   bool ok = true;
   for (u32 i = 0; i < g_text_words; i++) {
-    if (LIKELY(pagetable_end[i] == g_text_copy[i])) continue;
+    if (LIKELY(low_hole_end[i] == g_text_copy[i])) continue;
     u32 first = i, count = 0;
-    u32 bad = pagetable_end[i];
+    u32 bad = low_hole_end[i];
     for (; i < g_text_words; i++) {
-      if (pagetable_end[i] == g_text_copy[i]) {
+      if (low_hole_end[i] == g_text_copy[i]) {
         if (i - first > 64) break;  // end of this damaged run
         continue;
       }
       count++;
-      u32* w = &pagetable_end[i];
+      u32* w = &low_hole_end[i];
       *w = g_text_copy[i];
       asm volatile("dcbst 0,%0; sync; icbi 0,%0; sync; isync" ::"r"(w) : "memory");
     }
     if (g_repairs++ < 16)
       printf("[guard] code at %p overwritten after '%s' (%08x -> %08x, %u words): repaired\n",
-             (void*)&pagetable_end[first], where, (unsigned)g_text_copy[first], (unsigned)bad, (unsigned)count);
+             (void*)&low_hole_end[first], where, (unsigned)g_text_copy[first], (unsigned)bad, (unsigned)count);
     ok = false;
   }
   return ok;
@@ -383,7 +395,18 @@ static void RunGlobalConstructors() {
   for (InitFunc* f = __init_array_start; f != __init_array_end; ++f) (*f)();
 }
 
+// XeLL leaves the Ethernet controller running: every received packet is still
+// DMAed into XeLL's old receive buffers, in low memory where our code now
+// lives (it corrupted the code around 0x8003bf00). Stop RX/TX first thing
+// (same as libxenon's enet_quiesce, without pulling in lwIP).
+void StopXeLLNetwork() {
+  *(volatile u32*)0xEA001400 = 0;  // TX queue control
+  *(volatile u32*)0xEA001410 = 0;  // RX control
+  asm volatile("sync; eieio" ::: "memory");
+}
+
 int main() {
+  StopXeLLNetwork();
   RunGlobalConstructors();
   SnapshotText();
   xenos_init(VIDEO_MODE_AUTO);
