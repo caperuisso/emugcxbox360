@@ -17,6 +17,7 @@ extern "C" {
 #include <time/time.h>
 #include <usb/usbmain.h>
 #include <xenon_soc/xenon_power.h>
+#include <xenon_sound/sound.h>
 #include <xenos/xenos.h>
 int bdev_enum(int handle, const char** name);
 }
@@ -92,6 +93,39 @@ class XenonHost : public Host {
       }
     }
     memdcbst(fb, fb_pitch_w * (((fb_h + 31) >> 5) << 5) * 4);
+  }
+
+  // Audio: the Xenon DAC plays 48 kHz stereo little-endian s16. GameCube audio
+  // (32 or 48 kHz) is linearly resampled; when the buffer is full samples are
+  // dropped rather than stalling emulation.
+  bool sound_ready = false;
+  u32 resample_pos = 0;  // 16.16 fixed point position in the input stream
+  s16 last_l = 0, last_r = 0;
+  std::vector<u8> sound_out;
+
+  void PushAudio(const s16* samples, int frames, int rate) override {
+    if (!sound_ready) {
+      xenon_sound_init();
+      sound_ready = true;
+    }
+    if (frames <= 0 || rate <= 0) return;
+    u32 step = (u32)(((u64)rate << 16) / 48000);
+    sound_out.clear();
+    while ((resample_pos >> 16) < (u32)frames) {
+      u32 idx = resample_pos >> 16, frac = resample_pos & 0xFFFF;
+      s16 l0 = idx ? samples[(idx - 1) * 2] : last_l, r0 = idx ? samples[(idx - 1) * 2 + 1] : last_r;
+      s16 l1 = samples[idx * 2], r1 = samples[idx * 2 + 1];
+      s16 l = (s16)(l0 + (((s32)(l1 - l0) * (s32)frac) >> 16));
+      s16 r = (s16)(r0 + (((s32)(r1 - r0) * (s32)frac) >> 16));
+      u8 bytes[4] = {(u8)l, (u8)(l >> 8), (u8)r, (u8)(r >> 8)};  // little-endian
+      sound_out.insert(sound_out.end(), bytes, bytes + 4);
+      resample_pos += step;
+    }
+    resample_pos -= (u32)frames << 16;
+    last_l = samples[(frames - 1) * 2];
+    last_r = samples[(frames - 1) * 2 + 1];
+    int len = (int)sound_out.size();
+    if (len && xenon_sound_get_free() >= len) xenon_sound_submit(sound_out.data(), len);
   }
 
   void PollPad(int port, PadState& out) override {
