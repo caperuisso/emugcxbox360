@@ -11,7 +11,7 @@ endif()
 file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS src/core/*.cpp)
 add_library(emucore STATIC ${CORE_SOURCES} third_party/zstd/zstddeclib.c)
 target_include_directories(emucore PUBLIC src third_party)
-target_compile_options(emucore PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>)
+target_compile_options(emucore PRIVATE -fno-strict-aliasing $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>)
 
 find_package(SDL2 REQUIRED)
 add_executable(emugc src/platform/sdl/main_sdl.cpp)

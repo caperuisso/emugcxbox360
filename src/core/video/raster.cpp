@@ -1,0 +1,643 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Triangle rasterizer and the TEV (texture environment) pixel pipeline.
+#include <algorithm>
+#include <cmath>
+
+#include "core/video/video_internal.h"
+
+namespace Video {
+
+namespace {
+
+// ---- Scissor ----
+int s_sc_left, s_sc_top, s_sc_right, s_sc_bottom;  // EFB coordinates, right/bottom exclusive
+int s_x_off, s_y_off;                              // screen -> EFB offset
+
+// ---- Interpolation ----
+struct Slope {
+  float f0, dfdx, dfdy;
+  float x0, y0;  // reference point (pixel centre of v0)
+  float At(float x, float y) const { return f0 + dfdx * (x - x0) + dfdy * (y - y0); }
+};
+
+struct SlopeContext {
+  float x0, y0, dx10, dx20, dy10, dy20, det;
+};
+
+Slope MakeSlope(float f0, float f1, float f2, const SlopeContext& c) {
+  Slope s;
+  float d10 = f1 - f0, d20 = f2 - f0;
+  s.dfdx = (d20 * c.dy10 - d10 * c.dy20) / c.det;
+  s.dfdy = (c.dx20 * d10 - c.dx10 * d20) / c.det;
+  s.f0 = f0;
+  s.x0 = c.x0;
+  s.y0 = c.y0;
+  return s;
+}
+
+Slope s_z, s_w, s_color[2][4], s_tex[8][3];
+
+// ---- TEV state cached per triangle ----
+struct S16x4 {
+  s16 r, g, b, a;
+};
+
+u32 s_num_stages, s_num_texgens, s_num_ind, s_num_chans;
+u32 s_ksel_swap[4][4];  // swap tables: source channel for R, G, B, A
+
+inline s16 SignExtend11(u32 v) { return (s16)((s32)(v << 21) >> 21); }
+
+}  // namespace
+
+// TEV color registers are latched when written (the konst and normal banks
+// share BP addresses), so LoadBP calls this.
+S16x4 g_tev_color_regs[4];
+S16x4 g_tev_konst_regs[4];
+
+void SetTevRegister(u32 bp_reg, u32 value) {
+  u32 index = (bp_reg - BP_TEV_REGS) >> 1;
+  bool is_bg = (bp_reg - BP_TEV_REGS) & 1;
+  bool konst = (value >> 23) & 1;
+  S16x4& r = konst ? g_tev_konst_regs[index] : g_tev_color_regs[index];
+  if (!is_bg) {
+    r.r = SignExtend11(value & 0x7FF);
+    r.a = SignExtend11((value >> 12) & 0x7FF);
+  } else {
+    r.b = SignExtend11(value & 0x7FF);
+    r.g = SignExtend11((value >> 12) & 0x7FF);
+  }
+}
+
+namespace {
+
+// Konstant selector values 0..7 are fixed fractions.
+const u8 kKonstFixed[8] = {255, 223, 191, 159, 128, 96, 64, 32};
+
+inline S16x4 KonstColor(u32 sel) {
+  if (sel < 8) {
+    s16 v = kKonstFixed[sel];
+    return {v, v, v, v};
+  }
+  if (sel >= 12 && sel <= 15) return g_tev_konst_regs[sel - 12];
+  if (sel >= 16) {
+    const S16x4& k = g_tev_konst_regs[(sel - 16) & 3];
+    s16 v;
+    switch ((sel - 16) >> 2) {
+      case 0: v = k.r; break;
+      case 1: v = k.g; break;
+      case 2: v = k.b; break;
+      default: v = k.a; break;
+    }
+    return {v, v, v, v};
+  }
+  return {0, 0, 0, 0};
+}
+
+bool AlphaCompare(int alpha, int ref, u32 comp) {
+  switch (comp) {
+    case 0: return false;
+    case 1: return alpha < ref;
+    case 2: return alpha == ref;
+    case 3: return alpha <= ref;
+    case 4: return alpha > ref;
+    case 5: return alpha != ref;
+    case 6: return alpha >= ref;
+    default: return true;
+  }
+}
+
+bool AlphaTest(int alpha) {
+  u32 r = g_bp[BP_ALPHA_COMPARE];
+  bool a = AlphaCompare(alpha, Bits(r, 0, 8), Bits(r, 16, 3));
+  bool b = AlphaCompare(alpha, Bits(r, 8, 8), Bits(r, 19, 3));
+  switch (Bits(r, 22, 2)) {
+    case 0: return a && b;
+    case 1: return a || b;
+    case 2: return a != b;
+    default: return a == b;
+  }
+}
+
+// Fog parameters decoded from their 11-bit-mantissa float encoding.
+float FogFloat(u32 v) {
+  u32 mant = Bits(v, 0, 11), exp = Bits(v, 11, 8), sign = Bits(v, 19, 1);
+  u32 bits = (sign << 31) | (exp << 23) | (mant << 12);
+  return BitCast<float>(bits);
+}
+
+struct PixelInput {
+  int x, y;
+  u32 z;
+  u8 color[2][4];
+  s32 uv[8][2];     // texel coordinates with 7 fractional bits
+  s32 lod[16];
+  bool linear[16];
+  s32 ind_lod[4];
+  bool ind_linear[4];
+};
+
+inline s32 WrapIndirect(s32 coord, u32 mode) {
+  switch (mode) {
+    case 0: return coord;
+    case 1: return coord & ((256 << 7) - 1);
+    case 2: return coord & ((128 << 7) - 1);
+    case 3: return coord & ((64 << 7) - 1);
+    case 4: return coord & ((32 << 7) - 1);
+    case 5: return coord & ((16 << 7) - 1);
+    default: return 0;
+  }
+}
+
+void ShadePixel(const PixelInput& in) {
+  u32 zcomp = g_bp[BP_ZCOMPARE];
+  u32 zmode = g_bp[BP_ZMODE];
+  u32 z = in.z;
+  bool early_z = Bits(zcomp, 6, 1) && !(g_bp[BP_ZTEX2] & 0xC);
+  if (early_z && (zmode & 1) && !EFBDepthTest(in.x, in.y, z)) return;
+
+  S16x4 reg[4];
+  for (int i = 0; i < 4; i++) reg[i] = g_tev_color_regs[i];
+
+  // Indirect texture lookups
+  u8 ind_tex[4][4] = {};
+  u32 iref = g_bp[BP_IREF];
+  for (u32 s = 0; s < s_num_ind; s++) {
+    u32 map = Bits(iref, s * 6, 3), coord = Bits(iref, s * 6 + 3, 3);
+    if (coord >= s_num_texgens) coord = 0;
+    u32 scale = g_bp[BP_RAS1_SS0 + (s >> 1)];
+    u32 ss = Bits(scale, (s & 1) * 8, 4), ts = Bits(scale, (s & 1) * 8 + 4, 4);
+    SampleTexture(map, in.uv[coord][0] >> ss, in.uv[coord][1] >> ts, in.ind_lod[s], in.ind_linear[s], ind_tex[s]);
+  }
+
+  u8 raw_tex[4] = {0, 0, 0, 0};
+  s32 tc_s = 0, tc_t = 0;
+  u8 alpha_bump = 0;
+
+  for (u32 stage = 0; stage <= s_num_stages; stage++) {
+    u32 order = g_bp[BP_TREF + (stage >> 1)];
+    u32 shift = (stage & 1) ? 12 : 0;
+    u32 texmap = Bits(order, shift, 3);
+    u32 texcoord = Bits(order, shift + 3, 3);
+    bool tex_enable = Bits(order, shift + 6, 1);
+    u32 ras_chan = Bits(order, shift + 7, 3);
+    if (texcoord >= s_num_texgens) texcoord = 0;
+    u32 cc = g_bp[BP_TEV_COLOR_ENV + stage * 2];
+    u32 ac = g_bp[BP_TEV_COLOR_ENV + stage * 2 + 1];
+
+    // Indirect stage: perturb texture coordinates
+    {
+      u32 ind = g_bp[BP_IND_CMD + stage];
+      s32 s = in.uv[texcoord][0], t = in.uv[texcoord][1];
+      const u8* map = ind_tex[Bits(ind, 0, 2)];
+      u32 fmt = Bits(ind, 2, 2), bs = Bits(ind, 7, 2);
+      switch (bs) {
+        case 1: alpha_bump = map[3]; break;
+        case 2: alpha_bump = map[2]; break;
+        case 3: alpha_bump = map[1]; break;
+        default: alpha_bump = 0; break;
+      }
+      s32 bias_val = fmt == 0 ? -128 : 1;
+      s32 coord[3];
+      static const u32 kShift[4] = {0, 3, 4, 5};
+      coord[0] = (map[3] >> kShift[fmt]) + (Bits(ind, 4, 1) ? bias_val : 0);
+      coord[1] = (map[2] >> kShift[fmt]) + (Bits(ind, 5, 1) ? bias_val : 0);
+      coord[2] = (map[1] >> kShift[fmt]) + (Bits(ind, 6, 1) ? bias_val : 0);
+      switch (fmt) {
+        case 0: alpha_bump &= 0xF8; break;
+        case 1: alpha_bump <<= 5; break;
+        case 2: alpha_bump <<= 4; break;
+        default: alpha_bump <<= 3; break;
+      }
+      s32 trans[2] = {0, 0};
+      u32 mtx_index = Bits(ind, 9, 2), mtx_id = Bits(ind, 11, 2);
+      if (mtx_index) {
+        u32 base = BP_IND_MTX + (mtx_index - 1) * 3;
+        u32 m0 = g_bp[base], m1 = g_bp[base + 1], m2 = g_bp[base + 2];
+        auto s11 = [](u32 v) { return (s32)(v << 21) >> 21; };
+        s32 ma = s11(m0 & 0x7FF), mb = s11((m0 >> 11) & 0x7FF);
+        s32 mc = s11(m1 & 0x7FF), md = s11((m1 >> 11) & 0x7FF);
+        s32 me = s11(m2 & 0x7FF), mf = s11((m2 >> 11) & 0x7FF);
+        s32 scale = (s32)(Bits(m0, 22, 2) | (Bits(m1, 22, 2) << 2) | (Bits(m2, 22, 1) << 4)) - 17;
+        s32 sh = -scale;  // 17 - exponent
+        switch (mtx_id) {
+          case 0:
+            trans[0] = (ma * coord[0] + mc * coord[1] + me * coord[2]) >> 3;
+            trans[1] = (mb * coord[0] + md * coord[1] + mf * coord[2]) >> 3;
+            break;
+          case 1:
+            trans[0] = s * coord[0] / 256;
+            trans[1] = t * coord[0] / 256;
+            break;
+          case 2:
+            trans[0] = s * coord[1] / 256;
+            trans[1] = t * coord[1] / 256;
+            break;
+          default: break;
+        }
+        trans[0] = sh >= 0 ? trans[0] >> sh : trans[0] << -sh;
+        trans[1] = sh >= 0 ? trans[1] >> sh : trans[1] << -sh;
+      }
+      if (Bits(ind, 20, 1)) {
+        tc_s += WrapIndirect(s, Bits(ind, 13, 3)) + trans[0];
+        tc_t += WrapIndirect(t, Bits(ind, 16, 3)) + trans[1];
+      } else {
+        tc_s = WrapIndirect(s, Bits(ind, 13, 3)) + trans[0];
+        tc_t = WrapIndirect(t, Bits(ind, 16, 3)) + trans[1];
+      }
+    }
+
+    // Texture
+    S16x4 tex = {0, 0, 0, 0};
+    if (tex_enable) {
+      u8 texel[4] = {0, 0, 0, 0};
+      if (s_num_texgens > 0) SampleTexture(texmap, tc_s, tc_t, in.lod[stage], in.linear[stage], texel);
+      memcpy(raw_tex, texel, 4);
+      const u32* sw = s_ksel_swap[Bits(ac, 2, 2)];
+      tex = {texel[sw[0]], texel[sw[1]], texel[sw[2]], texel[sw[3]]};
+    }
+
+    // Rasterized color
+    S16x4 ras = {0, 0, 0, 0};
+    {
+      const u32* sw = s_ksel_swap[Bits(ac, 0, 2)];
+      if (ras_chan == 0 || ras_chan == 1) {
+        const u8* c = in.color[ras_chan];
+        ras = {c[sw[0]], c[sw[1]], c[sw[2]], c[sw[3]]};
+      } else if (ras_chan == 5) {
+        ras = {alpha_bump, alpha_bump, alpha_bump, alpha_bump};
+      } else if (ras_chan == 6) {
+        s16 n = (s16)(alpha_bump | (alpha_bump >> 5));
+        ras = {n, n, n, n};
+      }
+    }
+
+    // Konstant
+    u32 ksel = g_bp[BP_TEV_KSEL + (stage >> 1)];
+    u32 kshift = (stage & 1) ? 14 : 4;
+    S16x4 kc = KonstColor(Bits(ksel, kshift, 5));
+    S16x4 ka = KonstColor(Bits(ksel, kshift + 5, 5));
+    S16x4 konst = {kc.r, kc.g, kc.b, ka.a};
+
+    // Gather inputs
+    auto color_in = [&](u32 arg, int ch) -> s16 {
+      auto pick = [ch](const S16x4& v) { return ch == 0 ? v.r : ch == 1 ? v.g : v.b; };
+      switch (arg) {
+        case 0: return pick(reg[0]);
+        case 1: return reg[0].a;
+        case 2: return pick(reg[1]);
+        case 3: return reg[1].a;
+        case 4: return pick(reg[2]);
+        case 5: return reg[2].a;
+        case 6: return pick(reg[3]);
+        case 7: return reg[3].a;
+        case 8: return pick(tex);
+        case 9: return tex.a;
+        case 10: return pick(ras);
+        case 11: return ras.a;
+        case 12: return 255;
+        case 13: return 128;
+        case 14: return pick(konst);
+        default: return 0;
+      }
+    };
+    auto alpha_in = [&](u32 arg) -> s16 {
+      switch (arg) {
+        case 0: return reg[0].a;
+        case 1: return reg[1].a;
+        case 2: return reg[2].a;
+        case 3: return reg[3].a;
+        case 4: return tex.a;
+        case 5: return ras.a;
+        case 6: return konst.a;
+        default: return 0;
+      }
+    };
+
+    static const int kLShift[4] = {0, 1, 2, 0};
+    static const int kRShift[4] = {0, 0, 0, 1};
+    static const int kBias[3] = {0, 128, -128};
+
+    // Color combiner
+    {
+      u32 a_arg = Bits(cc, 12, 4), b_arg = Bits(cc, 8, 4), c_arg = Bits(cc, 4, 4), d_arg = Bits(cc, 0, 4);
+      u32 bias = Bits(cc, 16, 2), op = Bits(cc, 18, 1), clamp = Bits(cc, 19, 1);
+      u32 scale = Bits(cc, 20, 2), dest = Bits(cc, 22, 2);
+      s16 out[3];
+      if (bias != 3) {
+        for (int ch = 0; ch < 3; ch++) {
+          s32 a = color_in(a_arg, ch) & 0xFF, b = color_in(b_arg, ch) & 0xFF;
+          s32 c = color_in(c_arg, ch) & 0xFF, d = color_in(d_arg, ch);
+          d = (s32)(s16)(d << 5) >> 5;  // 11-bit signed
+          s32 c2 = c + (c >> 7);
+          s32 temp = a * (256 - c2) + b * c2;
+          temp <<= kLShift[scale];
+          temp += (scale == 3) ? 0 : (op ? 127 : 128);
+          temp >>= 8;
+          if (op) temp = -temp;
+          s32 r = ((d + kBias[bias]) << kLShift[scale]) + temp;
+          out[ch] = (s16)(r >> kRShift[scale]);
+        }
+      } else {
+        u32 mode = scale;
+        for (int ch = 0; ch < 3; ch++) {
+          u32 a, b;
+          auto av = [&](int c) { return (u32)(color_in(a_arg, c) & 0xFF); };
+          auto bv = [&](int c) { return (u32)(color_in(b_arg, c) & 0xFF); };
+          switch (mode) {
+            case 0: a = av(0); b = bv(0); break;
+            case 1: a = (av(1) << 8) | av(0); b = (bv(1) << 8) | bv(0); break;
+            case 2: a = (av(2) << 16) | (av(1) << 8) | av(0); b = (bv(2) << 16) | (bv(1) << 8) | bv(0); break;
+            default: a = av(ch); b = bv(ch); break;
+          }
+          bool pass = op ? (a == b) : (a > b);
+          out[ch] = (s16)(color_in(d_arg, ch) + (pass ? (color_in(c_arg, ch) & 0xFF) : 0));
+        }
+      }
+      for (int ch = 0; ch < 3; ch++) out[ch] = clamp ? std::clamp<s16>(out[ch], 0, 255) : std::clamp<s16>(out[ch], -1024, 1023);
+      reg[dest].r = out[0];
+      reg[dest].g = out[1];
+      reg[dest].b = out[2];
+    }
+
+    // Alpha combiner
+    {
+      u32 a_arg = Bits(ac, 13, 3), b_arg = Bits(ac, 10, 3), c_arg = Bits(ac, 7, 3), d_arg = Bits(ac, 4, 3);
+      u32 bias = Bits(ac, 16, 2), op = Bits(ac, 18, 1), clamp = Bits(ac, 19, 1);
+      u32 scale = Bits(ac, 20, 2), dest = Bits(ac, 22, 2);
+      s16 out;
+      if (bias != 3) {
+        s32 a = alpha_in(a_arg) & 0xFF, b = alpha_in(b_arg) & 0xFF, c = alpha_in(c_arg) & 0xFF;
+        s32 d = (s32)(s16)(alpha_in(d_arg) << 5) >> 5;
+        s32 c2 = c + (c >> 7);
+        s32 temp = a * (256 - c2) + b * c2;
+        temp <<= kLShift[scale];
+        temp += (scale == 3) ? 0 : (op ? 127 : 128);
+        temp = op ? (-temp >> 8) : (temp >> 8);
+        s32 r = ((d + kBias[bias]) << kLShift[scale]) + temp;
+        out = (s16)(r >> kRShift[scale]);
+      } else {
+        u32 a, b;
+        auto colA = [&](int c) { return (u32)(color_in(Bits(cc, 12, 4), c) & 0xFF); };
+        auto colB = [&](int c) { return (u32)(color_in(Bits(cc, 8, 4), c) & 0xFF); };
+        switch (scale) {
+          case 0: a = colA(0); b = colB(0); break;
+          case 1: a = (colA(1) << 8) | colA(0); b = (colB(1) << 8) | colB(0); break;
+          case 2: a = (colA(2) << 16) | (colA(1) << 8) | colA(0); b = (colB(2) << 16) | (colB(1) << 8) | colB(0); break;
+          default: a = alpha_in(a_arg) & 0xFF; b = alpha_in(b_arg) & 0xFF; break;
+        }
+        bool pass = op ? (a == b) : (a > b);
+        out = (s16)(alpha_in(d_arg) + (pass ? (alpha_in(c_arg) & 0xFF) : 0));
+      }
+      reg[dest].a = clamp ? std::clamp<s16>(out, 0, 255) : std::clamp<s16>(out, -1024, 1023);
+    }
+  }
+
+  u32 last = s_num_stages;
+  u32 cdest = Bits(g_bp[BP_TEV_COLOR_ENV + last * 2], 22, 2);
+  u32 adest = Bits(g_bp[BP_TEV_COLOR_ENV + last * 2 + 1], 22, 2);
+  u8 out[4] = {(u8)reg[cdest].r, (u8)reg[cdest].g, (u8)reg[cdest].b, (u8)reg[adest].a};
+
+  if (!AlphaTest(out[3])) return;
+
+  // Z texture
+  u32 ztex2 = g_bp[BP_ZTEX2];
+  if (ztex2 & 0xC) {
+    u32 zt = g_bp[BP_ZTEX1] & 0xFFFFFF;
+    u32 op = Bits(ztex2, 2, 2);  // 0 disabled, 1 add, 2 replace; type in bits 0-1
+    if (op) {
+      switch (Bits(ztex2, 0, 2)) {
+        case 0: zt += raw_tex[3]; break;
+        case 1: zt += ((u32)raw_tex[3] << 8) | raw_tex[0]; break;
+        default: zt += ((u32)raw_tex[0] << 16) | ((u32)raw_tex[1] << 8) | raw_tex[2]; break;
+      }
+      if (op == 1) zt += z;
+      z = zt & 0xFFFFFF;
+    }
+  }
+
+  // Fog
+  u32 fog3 = g_bp[BP_FOG3];
+  u32 fsel = Bits(fog3, 21, 3);
+  if (fsel) {
+    float a = FogFloat(g_bp[BP_FOG0]);
+    float c = FogFloat(fog3);
+    float ze;
+    if (!Bits(fog3, 20, 1)) {  // perspective
+      s32 denom = (s32)(g_bp[BP_FOG_B_MAG] & 0xFFFFFF) - (s32)(z >> (g_bp[BP_FOG_B_EXP] & 0x1F));
+      ze = denom ? (a * 16777215.0f) / (float)denom : 0.0f;
+    } else {
+      ze = a * ((float)z / 16777215.0f);
+    }
+    ze -= c;
+    float fog = std::clamp(ze, 0.0f, 1.0f);
+    switch (fsel) {
+      case 4: fog = 1.0f - std::pow(2.0f, -8.0f * fog); break;
+      case 5: fog = 1.0f - std::pow(2.0f, -8.0f * fog * fog); break;
+      case 6: fog = std::pow(2.0f, -8.0f * (1.0f - fog)); break;
+      case 7: fog = std::pow(2.0f, -8.0f * (1.0f - fog) * (1.0f - fog)); break;
+      default: break;
+    }
+    u32 fi = (u32)(fog * 256), inv = 256 - fi;
+    u32 fc = g_bp[BP_FOG_COLOR];
+    u8 fr = (u8)(fc >> 16), fg = (u8)(fc >> 8), fb = (u8)fc;
+    out[0] = (u8)((out[0] * inv + fi * fr) >> 8);
+    out[1] = (u8)((out[1] * inv + fi * fg) >> 8);
+    out[2] = (u8)((out[2] * inv + fi * fb) >> 8);
+  }
+
+  if (!early_z && (zmode & 1) && !EFBDepthTest(in.x, in.y, z)) return;
+  if ((zmode & 1) && (zmode & 0x10)) EFBWriteDepth(in.x, in.y, z);
+  g_stats.pixels++;
+  EFBBlend(in.x, in.y, out);
+}
+
+// Fixed-point log2 used for texture LOD (4 fractional bits), as in hardware.
+inline s32 FixedLog2(float f) {
+  u32 x = BitCast<u32>(f);
+  s32 log_int = (s32)((x & 0x7F800000) >> 19) - 2032;
+  s32 log_frac = (s32)((x & 0x007FFFFF) >> 19);
+  return log_int + log_frac;
+}
+
+}  // namespace
+
+void ComputeLOD(u32 texmap, float dsdx, float dsdy, float dtdx, float dtdy, s32& lod, bool& linear) {
+  u32 mode0 = g_bp[TexReg(0x80, texmap)], mode1 = g_bp[TexReg(0x84, texmap)];
+  float s_delta, t_delta;
+  if (Bits(mode0, 8, 1)) {  // diagonal LOD
+    s_delta = std::fabs(dsdx) + std::fabs(dsdy);
+    t_delta = std::fabs(dtdx) + std::fabs(dtdy);
+  } else {
+    s_delta = std::max(std::fabs(dsdx), std::fabs(dsdy));
+    t_delta = std::max(std::fabs(dtdx), std::fabs(dtdy));
+  }
+  s32 l = FixedLog2(std::max(s_delta, t_delta));
+  s32 bias = (s32)(s8)Bits(mode0, 9, 8);
+  l += bias >> 1;
+  linear = (l > 0 && Bits(mode0, 7, 1)) || (l <= 0 && Bits(mode0, 4, 1));
+  s32 max_lod = (s32)Bits(mode1, 8, 8), min_lod = (s32)Bits(mode1, 0, 8);
+  l = std::clamp(l, min_lod, std::max(min_lod, max_lod));
+  lod = l;
+}
+
+void UpdateScissor() {
+  u32 tl = g_bp[BP_SCISSOR_TL], br = g_bp[BP_SCISSOR_BR], off = g_bp[BP_SCISSOR_OFFSET];
+  s_x_off = (int)Bits(off, 0, 10) * 2 - 342;
+  s_y_off = (int)Bits(off, 10, 10) * 2 - 342;
+  // Scissor registers and the viewport both carry the 342 pixel offset.
+  s_sc_left = (int)Bits(tl, 12, 12) - 342 - s_x_off;
+  s_sc_top = (int)Bits(tl, 0, 12) - 342 - s_y_off;
+  s_sc_right = (int)Bits(br, 12, 12) - 342 - s_x_off + 1;
+  s_sc_bottom = (int)Bits(br, 0, 12) - 342 - s_y_off + 1;
+  s_sc_left = std::max(s_sc_left, 0);
+  s_sc_top = std::max(s_sc_top, 0);
+  s_sc_right = std::min(s_sc_right, EFB_WIDTH);
+  s_sc_bottom = std::min(s_sc_bottom, EFB_HEIGHT);
+}
+
+void LoadSwapTables() {
+  for (int t = 0; t < 4; t++) {
+    u32 k0 = g_bp[BP_TEV_KSEL + t * 2], k1 = g_bp[BP_TEV_KSEL + t * 2 + 1];
+    s_ksel_swap[t][0] = Bits(k0, 0, 2);
+    s_ksel_swap[t][1] = Bits(k0, 2, 2);
+    s_ksel_swap[t][2] = Bits(k1, 0, 2);
+    s_ksel_swap[t][3] = Bits(k1, 2, 2);
+  }
+}
+
+void DrawTriangle(const OutputVertex* v0, const OutputVertex* v1, const OutputVertex* v2) {
+  u32 genmode = g_bp[BP_GENMODE];
+  s_num_texgens = Bits(genmode, 0, 4);
+  s_num_chans = Bits(genmode, 4, 3);
+  s_num_stages = Bits(genmode, 10, 4);
+  s_num_ind = Bits(genmode, 16, 3);
+  LoadSwapTables();
+
+  // Screen -> EFB coordinates
+  float xs[3] = {v0->screen.x - 342.0f - s_x_off, v1->screen.x - 342.0f - s_x_off, v2->screen.x - 342.0f - s_x_off};
+  float ys[3] = {v0->screen.y - 342.0f - s_y_off, v1->screen.y - 342.0f - s_y_off, v2->screen.y - 342.0f - s_y_off};
+
+  // 28.4 fixed point edge setup (hardware samples pixel centres)
+  auto fx = [](float v) { return (s32)std::floor(v * 16.0f + 0.5f); };
+  s32 X1 = fx(xs[0]), X2 = fx(xs[1]), X3 = fx(xs[2]);
+  s32 Y1 = fx(ys[0]), Y2 = fx(ys[1]), Y3 = fx(ys[2]);
+
+  int minx = (std::min({X1, X2, X3}) + 0xF) >> 4, maxx = (std::max({X1, X2, X3}) + 0xF) >> 4;
+  int miny = (std::min({Y1, Y2, Y3}) + 0xF) >> 4, maxy = (std::max({Y1, Y2, Y3}) + 0xF) >> 4;
+  minx = std::max(minx, s_sc_left);
+  maxx = std::min(maxx, s_sc_right);
+  miny = std::max(miny, s_sc_top);
+  maxy = std::min(maxy, s_sc_bottom);
+  if (minx >= maxx || miny >= maxy) return;
+
+  SlopeContext ctx;
+  ctx.x0 = xs[0];
+  ctx.y0 = ys[0];
+  ctx.dx10 = xs[1] - xs[0];
+  ctx.dx20 = xs[2] - xs[0];
+  ctx.dy10 = ys[1] - ys[0];
+  ctx.dy20 = ys[2] - ys[0];
+  ctx.det = ctx.dx20 * ctx.dy10 - ctx.dx10 * ctx.dy20;
+  if (ctx.det == 0.0f) return;
+
+  s_z = MakeSlope(v0->screen.z, v1->screen.z, v2->screen.z, ctx);
+  float w[3] = {1.0f / v0->proj[3], 1.0f / v1->proj[3], 1.0f / v2->proj[3]};
+  s_w = MakeSlope(w[0], w[1], w[2], ctx);
+  for (u32 c = 0; c < 2; c++)
+    for (int i = 0; i < 4; i++) s_color[c][i] = MakeSlope(v0->color[c][i], v1->color[c][i], v2->color[c][i], ctx);
+  for (u32 t = 0; t < s_num_texgens; t++) {
+    s_tex[t][0] = MakeSlope(v0->texcoords[t].x * w[0], v1->texcoords[t].x * w[1], v2->texcoords[t].x * w[2], ctx);
+    s_tex[t][1] = MakeSlope(v0->texcoords[t].y * w[0], v1->texcoords[t].y * w[1], v2->texcoords[t].y * w[2], ctx);
+    s_tex[t][2] = MakeSlope(v0->texcoords[t].z * w[0], v1->texcoords[t].z * w[1], v2->texcoords[t].z * w[2], ctx);
+  }
+
+  // Edge equations (top-left fill convention)
+  const s32 DX12 = X1 - X2, DX23 = X2 - X3, DX31 = X3 - X1;
+  const s32 DY12 = Y1 - Y2, DY23 = Y2 - Y3, DY31 = Y3 - Y1;
+  s64 C1 = (s64)DY12 * X1 - (s64)DX12 * Y1;
+  s64 C2 = (s64)DY23 * X2 - (s64)DX23 * Y2;
+  s64 C3 = (s64)DY31 * X3 - (s64)DX31 * Y3;
+  if (DY12 < 0 || (DY12 == 0 && DX12 > 0)) C1++;
+  if (DY23 < 0 || (DY23 == 0 && DX23 > 0)) C2++;
+  if (DY31 < 0 || (DY31 == 0 && DX31 > 0)) C3++;
+  // Orientation: make the inside test "> 0" regardless of winding.
+  bool flip = ((s64)DX12 * DY31 - (s64)DY12 * DX31) < 0;
+
+  auto inside = [&](int x, int y) {
+    s64 px = (s64)x << 4, py = (s64)y << 4;
+    s64 e1 = C1 + DX12 * py - DY12 * px;
+    s64 e2 = C2 + DX23 * py - DY23 * px;
+    s64 e3 = C3 + DX31 * py - DY31 * px;
+    if (flip) return e1 < 0 && e2 < 0 && e3 < 0;
+    return e1 > 0 && e2 > 0 && e3 > 0;
+  };
+
+  u32 iref = g_bp[BP_IREF];
+  PixelInput px;
+  // Process 2x2 blocks so texture LOD can use screen-space derivatives.
+  for (int by = miny & ~1; by < maxy; by += 2) {
+    for (int bx = minx & ~1; bx < maxx; bx += 2) {
+      bool cover[2][2];
+      bool any = false;
+      for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+          int x = bx + i, y = by + j;
+          cover[i][j] = x >= minx && x < maxx && y >= miny && y < maxy && inside(x, y);
+          any |= cover[i][j];
+        }
+      if (!any) continue;
+
+      // Perspective-correct texture coordinates for the block
+      float uv[2][2][8][2];
+      for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+          float cx = bx + i + 0.5f, cy = by + j + 0.5f;
+          float inv_w = 1.0f / s_w.At(cx, cy);
+          for (u32 t = 0; t < s_num_texgens; t++) {
+            float proj = inv_w;
+            float q = s_tex[t][2].At(cx, cy) * inv_w;
+            if (q != 0.0f) proj = inv_w / q;
+            uv[i][j][t][0] = s_tex[t][0].At(cx, cy) * proj;
+            uv[i][j][t][1] = s_tex[t][1].At(cx, cy) * proj;
+          }
+        }
+      // LOD per TEV stage / indirect stage
+      for (u32 s = 0; s <= s_num_stages; s++) {
+        u32 order = g_bp[BP_TREF + (s >> 1)];
+        u32 shift = (s & 1) ? 12 : 0;
+        if (!Bits(order, shift + 6, 1)) continue;
+        u32 map = Bits(order, shift, 3), tc = Bits(order, shift + 3, 3);
+        if (tc >= s_num_texgens) tc = 0;
+        ComputeLOD(map, uv[0][0][tc][0] - uv[1][0][tc][0], uv[0][0][tc][0] - uv[0][1][tc][0],
+                   uv[0][0][tc][1] - uv[1][0][tc][1], uv[0][0][tc][1] - uv[0][1][tc][1], px.lod[s], px.linear[s]);
+      }
+      for (u32 s = 0; s < s_num_ind; s++) {
+        u32 map = Bits(iref, s * 6, 3), tc = Bits(iref, s * 6 + 3, 3);
+        if (tc >= s_num_texgens) tc = 0;
+        ComputeLOD(map, uv[0][0][tc][0] - uv[1][0][tc][0], uv[0][0][tc][0] - uv[0][1][tc][0],
+                   uv[0][0][tc][1] - uv[1][0][tc][1], uv[0][0][tc][1] - uv[0][1][tc][1], px.ind_lod[s],
+                   px.ind_linear[s]);
+      }
+
+      for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+          if (!cover[i][j]) continue;
+          int x = bx + i, y = by + j;
+          float cx = x + 0.5f, cy = y + 0.5f;
+          px.x = x;
+          px.y = y;
+          px.z = (u32)std::clamp(s_z.At(cx, cy), 0.0f, 16777215.0f);
+          for (u32 c = 0; c < 2; c++)
+            for (int k = 0; k < 4; k++)
+              px.color[c][k] = (u8)std::clamp(s_color[c][k].At(cx, cy), 0.0f, 255.0f);
+          for (u32 t = 0; t < s_num_texgens; t++) {
+            px.uv[t][0] = (s32)(uv[i][j][t][0] * 128.0f);
+            px.uv[t][1] = (s32)(uv[i][j][t][1] * 128.0f);
+          }
+          ShadePixel(px);
+        }
+    }
+  }
+}
+
+}  // namespace Video

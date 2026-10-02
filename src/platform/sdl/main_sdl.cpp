@@ -11,6 +11,7 @@
 
 #include "core/gekko/cpu.h"
 #include "core/hle.h"
+#include "core/video/video.h"
 #include "core/system.h"
 
 namespace {
@@ -191,7 +192,8 @@ void Usage(const char* argv0) {
           "  --unthrottled     do not limit speed to 60 fields/s\n"
           "  --scale N         window scale (default 1)\n"
           "  --regs            print CPU registers on exit (debugging)\n"
-          "  --osreport ADDR   log calls to the guest OSReport at ADDR (debugging)\n",
+          "  --osreport ADDR   log calls to the guest OSReport at ADDR (debugging)\n"
+          "  --stats           print GPU statistics every 60 fields\n",
           argv0);
 }
 
@@ -202,7 +204,7 @@ int main(int argc, char** argv) {
   std::string path, dump;
   long max_frames = -1;
   int scale = 1;
-  bool throttle = true, dump_regs = false;
+  bool throttle = true, dump_regs = false, stats = false;
   std::vector<u32> osreport_addrs;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -213,6 +215,7 @@ int main(int argc, char** argv) {
     else if (a == "--unthrottled") throttle = false;
     else if (a == "--scale" && i + 1 < argc) scale = atoi(argv[++i]);
     else if (a == "--regs") dump_regs = true;
+    else if (a == "--stats") stats = true;
     else if (a == "--osreport" && i + 1 < argc) osreport_addrs.push_back((u32)strtoul(argv[++i], nullptr, 0));
     else if (a[0] == '-') { Usage(argv[0]); return 1; }
     else path = a;
@@ -240,6 +243,12 @@ int main(int argc, char** argv) {
     System::RunFrame();
     frames++;
     fps_frames++;
+    if (stats && frames % 60 == 0) {
+      const Video::Stats& s = Video::g_stats;
+      printf("[stats] field %ld: prims=%u verts=%u tris=%u pixels=%u efb_copies=%u xfb_copies=%u pc=%08x\n", frames,
+             s.primitives, s.vertices, s.triangles, s.pixels, s.efb_copies, s.xfb_copies, cpu.pc);
+      memset(&Video::g_stats, 0, sizeof(Video::g_stats));
+    }
     if (max_frames >= 0 && frames >= max_frames) break;
     auto now = clock::now();
     if (throttle) {

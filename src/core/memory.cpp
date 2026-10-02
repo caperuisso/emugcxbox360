@@ -5,6 +5,7 @@
 
 #include "core/gekko/cpu.h"
 #include "core/hw/hw.h"
+#include "core/video/video.h"
 
 namespace Mem {
 
@@ -73,7 +74,11 @@ T ReadPhys(u32 pa) {
     if (sizeof(T) == 4) return (T)HW::Read32(pa);
     return (T)(((u64)HW::Read32(pa) << 32) | HW::Read32(pa + 4));
   }
-  if ((pa & 0xFF000000) == 0x08000000) return 0;  // EFB peek: not emulated yet
+  if ((pa & 0xFF000000) == 0x08000000) {  // EFB peek
+    u32 x = (pa & 0xFFF) >> 2, y = (pa >> 12) & 0x3FF;
+    u32 v = (pa & 0x400000) ? Video::PeekEFBDepth(x, y) : Video::PeekEFBColor(x, y);
+    return (T)v;
+  }
   static int warn = 0;
   if (warn++ < 32) LOG("Mem: unmapped read%d @%08x (pc=%08x)\n", (int)sizeof(T) * 8, pa, cpu.pc);
   return 0;
@@ -107,7 +112,14 @@ void WritePhys(u32 pa, T v) {
     }
     return;
   }
-  if ((pa & 0xFF000000) == 0x08000000) return;  // EFB poke: ignored
+  if ((pa & 0xFF000000) == 0x08000000) {  // EFB poke
+    u32 x = (pa & 0xFFF) >> 2, y = (pa >> 12) & 0x3FF;
+    if (pa & 0x400000)
+      Video::PokeEFBDepth(x, y, (u32)v);
+    else
+      Video::PokeEFBColor(x, y, (u32)v);
+    return;
+  }
   static int warn = 0;
   if (warn++ < 32) LOG("Mem: unmapped write%d @%08x (pc=%08x)\n", (int)sizeof(T) * 8, pa, cpu.pc);
 }
