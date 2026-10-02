@@ -25,6 +25,7 @@ void WriteWords(u32 addr, const void* src, u32 count) {
   u8* p = Mem::PhysPtr(addr & 0x01FFFFFF, count * 2);
   if (!p) return;
   for (u32 i = 0; i < count; i++) StoreBE16(p + i * 2, s[i]);
+  Mem::MarkWritten(addr & 0x01FFFFFF, count * 2);
 }
 
 template <size_t B>

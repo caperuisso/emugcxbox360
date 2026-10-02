@@ -122,6 +122,9 @@ void ComputeLOD(u32 texmap, float dsdx, float dsdy, float dtdx, float dtdy, s32&
 void LoadTLUT(u32 value);
 void PreloadTMEM(u32 value);
 void TextureReset();
+void InvalidateTextureCache();
+// Decodes/looks up the textures of the units in `mask` before a draw.
+void BindTextures(u32 mask);
 
 // Save state pieces
 void RasterDoState(StateBuffer& s);

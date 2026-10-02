@@ -648,6 +648,11 @@ void BeginDraw() {
     S16x4 ka = KonstColor(Bits(ksel, kshift + 5, 5));
     c.konst = {kc.r, kc.g, kc.b, ka.a};
   }
+  u32 tex_mask = 0;
+  for (u32 stage = 0; stage <= s_num_stages; stage++)
+    if (s_stage[stage].tex_enable) tex_mask |= 1u << s_stage[stage].texmap;
+  for (u32 st = 0; st < s_num_ind; st++) tex_mask |= 1u << Bits(s_iref, st * 6, 3);
+  BindTextures(tex_mask);
   s_batch.clear();
   s_batch_area = 0;
 }

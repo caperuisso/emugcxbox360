@@ -12,6 +12,8 @@ namespace Mem {
 
 u8* g_mem1 = nullptr;
 u8 g_l2[L2_SIZE];
+u32* g_page_stamp = nullptr;
+u32 g_write_stamp = 1;
 
 namespace {
 // One entry per 128 KiB block of the 4 GiB effective space.
@@ -88,6 +90,7 @@ T ReadPhys(u32 pa) {
 template <typename T>
 void WritePhys(u32 pa, T v) {
   if (u8* p = RamPtr(pa)) {
+    if (LIKELY(p >= g_mem1 && p < g_mem1 + MEM1_SIZE)) g_page_stamp[(p - g_mem1) >> PAGE_SHIFT] = g_write_stamp;
     if (sizeof(T) == 1) *p = (u8)v;
     else if (sizeof(T) == 2) StoreBE16(p, (u16)v);
     else if (sizeof(T) == 4) StoreBE32(p, (u32)v);
@@ -148,7 +151,8 @@ void WriteEA(u32 ea, T v) {
 
 bool Init() {
   if (!g_mem1) g_mem1 = (u8*)malloc(MEM1_SIZE);
-  if (!g_mem1) return false;
+  if (!g_page_stamp) g_page_stamp = (u32*)calloc(MEM1_SIZE >> PAGE_SHIFT, sizeof(u32));
+  if (!g_mem1 || !g_page_stamp) return false;
   Clear();
   return true;
 }
@@ -160,12 +164,14 @@ void Shutdown() {
 
 void Clear() {
   memset(g_mem1, 0, MEM1_SIZE);
+  MarkWritten(0, MEM1_SIZE);
   memset(g_l2, 0, sizeof(g_l2));
 }
 
 void DoState(StateBuffer& s) {
   s.Marker("Memory");
   s.DoBytes(g_mem1, MEM1_SIZE);
+  if (s.IsReading()) MarkWritten(0, MEM1_SIZE);
   s.DoBytes(g_l2, L2_SIZE);
 }
 

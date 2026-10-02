@@ -22,6 +22,7 @@ void WriteWords(u32 addr, const u16* src, u32 count) {
   u8* p = Mem::PhysPtr(addr & 0x01FFFFFF, count * 2);
   if (!p) return;
   for (u32 i = 0; i < count; i++) StoreBE16(p + i * 2, src[i]);
+  Mem::MarkWritten(addr & 0x01FFFFFF, count * 2);
 }
 void ReadInts(u32 addr, int* dst, u32 count) {
   const u8* p = Mem::PhysPtr(addr & 0x01FFFFFF, count * 4);
@@ -31,6 +32,7 @@ void WriteInts(u32 addr, const int* src, u32 count) {
   u8* p = Mem::PhysPtr(addr & 0x01FFFFFF, count * 4);
   if (!p) return;
   for (u32 i = 0; i < count; i++) StoreBE32(p + i * 4, (u32)src[i]);
+  Mem::MarkWritten(addr & 0x01FFFFFF, count * 4);
 }
 
 // ---- AX parameter block (GameCube layout, 122 words) ----

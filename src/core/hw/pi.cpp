@@ -75,7 +75,10 @@ void Write32(u32 off, u32 v) {
 }
 
 void FifoWriteBlock(const u8* block) {
-  if (u8* dst = Mem::PhysPtr(s_fifo_wptr & 0x03FFFFE0, 32)) memcpy(dst, block, 32);
+  if (u8* dst = Mem::PhysPtr(s_fifo_wptr & 0x03FFFFE0, 32)) {
+    memcpy(dst, block, 32);
+    Mem::MarkWritten(s_fifo_wptr & 0x03FFFFE0, 32);
+  }
   u32 ptr = (s_fifo_wptr & 0x03FFFFE0) + 32;
   u32 wrap = s_fifo_wptr & 0x20000000;
   if (s_fifo_end && ptr > s_fifo_end) {

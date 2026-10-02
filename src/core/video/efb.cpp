@@ -162,6 +162,7 @@ void CopyToTexture(u32 cmd, int sx, int sy, int w, int h) {
       u8* out = Mem::PhysPtr(block_addr, block_bytes);
       if (!out) continue;
       memset(out, 0, block_bytes);
+      Mem::MarkWritten(block_addr, block_bytes);
       for (int ty = 0; ty < bh; ty++) {
         for (int tx = 0; tx < bw; tx++) {
           int px = bx * bw + tx, py = by * bh + ty;
@@ -242,6 +243,7 @@ void CopyToXFB(u32 cmd, int sx, int sy, int w, int h) {
     int src_y = sy + std::min(h - 1, (int)(oy / yscale));
     u8* line = Mem::PhysPtr(dest + oy * stride, (u32)w * 2);
     if (!line) break;
+    Mem::MarkWritten(dest + oy * stride, (u32)w * 2);
     for (int x = 0; x < w; x += 2) {
       int rgb[2][3];
       for (int k = 0; k < 2; k++) {

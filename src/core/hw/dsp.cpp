@@ -63,7 +63,10 @@ void RunARAMDMA() {
         s_aram[a] = mem[k];
     }
   }
-  if (to_mram) BlockCache::Invalidate(s_ar_mm, len);
+  if (to_mram) {
+    BlockCache::Invalidate(s_ar_mm, len);
+    Mem::MarkWritten(s_ar_mm, len);
+  }
   s_ar_mm += len;
   s_ar_aram += len;
   s_ar_cnt &= 0x80000000;

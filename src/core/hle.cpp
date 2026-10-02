@@ -41,6 +41,7 @@ bool Patch(u32 addr, Handler handler, const char* name) {
   Hook h{addr, LoadBE32(p), handler, name};
   StoreBE32(p, (1u << 26) | (u32)s_hooks.size());
   BlockCache::Invalidate(addr & 0x01FFFFFF, 4);
+  Mem::MarkWritten(addr & 0x01FFFFFF, 4);
   s_hooks.push_back(h);
   LOG("HLE: hooked %s at %08x\n", name, addr);
   return true;

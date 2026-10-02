@@ -3,6 +3,8 @@
 // for every GameCube texture format.
 #include <algorithm>
 #include <cstdlib>
+#include <memory>
+#include <vector>
 
 #include "core/memory.h"
 #include "core/state.h"
@@ -184,95 +186,287 @@ inline int Wrap(int coord, u32 mode, int size) {
   }
 }
 
-void SampleMip(u32 texmap, s32 s, s32 t, s32 mip, bool linear, u8 out[4]) {
-  u32 mode0 = g_bp[TexReg(0x80, texmap)];
+// ---- Decoded texture cache ----
+// Textures are decoded once to RGBA8 (all needed mip levels) and reused until
+// their source changes: guest RAM pages written since decoding (Mem write
+// stamps), TMEM reloads, or a different palette.
+
+struct LevelSource {
+  Source src;
+  const u8* odd;
+  int w1, h1;  // level size minus one
+};
+
+struct TexParams {
+  u32 fmt, tlut_fmt;
+  int w1, h1;
+  bool from_tmem;
+  const u8* tlut;
+  u32 ram_addr;
+};
+
+TexParams GetParams(u32 texmap) {
   u32 img0 = g_bp[TexReg(0x88, texmap)];
   u32 img1 = g_bp[TexReg(0x8C, texmap)];
-  u32 img2 = g_bp[TexReg(0x90, texmap)];
   u32 img3 = g_bp[TexReg(0x94, texmap)];
   u32 tlutr = g_bp[TexReg(0x98, texmap)];
-  u32 fmt = Bits(img0, 20, 4);
-  int w1 = (int)Bits(img0, 0, 10), h1 = (int)Bits(img0, 10, 10);
-  u32 tlut_fmt = Bits(tlutr, 10, 2);
-  const u8* tlut = s_tmem + ((Bits(tlutr, 0, 10) << 9) & (TMEM_SIZE - 1));
-  bool from_tmem = Bits(img1, 21, 1);
+  TexParams p;
+  p.fmt = Bits(img0, 20, 4);
+  p.w1 = (int)Bits(img0, 0, 10);
+  p.h1 = (int)Bits(img0, 10, 10);
+  p.tlut_fmt = Bits(tlutr, 10, 2);
+  p.tlut = s_tmem + ((Bits(tlutr, 0, 10) << 9) & (TMEM_SIZE - 1));
+  p.from_tmem = Bits(img1, 21, 1);
+  p.ram_addr = (Bits(img3, 0, 24) << 5) & 0x01FFFFFF;
+  return p;
+}
 
-  Source src;
-  const u8* odd = nullptr;
-  if (from_tmem) {
+// Source data of mip level `mip` (same layout rules as the hardware).
+bool GetLevelSource(u32 texmap, const TexParams& p, int mip, LevelSource& out) {
+  u32 img1 = g_bp[TexReg(0x8C, texmap)];
+  u32 img2 = g_bp[TexReg(0x90, texmap)];
+  out.odd = nullptr;
+  if (p.from_tmem) {
     u32 even_off = Bits(img1, 0, 15) * TMEM_LINE;
-    src = {s_tmem + (even_off & (TMEM_SIZE - 1)), TMEM_SIZE - (even_off & (TMEM_SIZE - 1))};
-    odd = s_tmem + ((Bits(img2, 0, 15) * TMEM_LINE) & (TMEM_SIZE - 1));
+    out.src = {s_tmem + (even_off & (TMEM_SIZE - 1)), TMEM_SIZE - (even_off & (TMEM_SIZE - 1))};
+    out.odd = s_tmem + ((Bits(img2, 0, 15) * TMEM_LINE) & (TMEM_SIZE - 1));
   } else {
-    u32 addr = (Bits(img3, 0, 24) << 5) & 0x01FFFFFF;
-    u8* p = Mem::PhysPtr(addr, 1);
-    src = {p, p ? Mem::MEM1_SIZE - addr : 0};
-    if (!p) {
-      out[0] = out[1] = out[2] = out[3] = 0;
-      return;
-    }
+    u8* ptr = Mem::PhysPtr(p.ram_addr, 1);
+    if (!ptr) return false;
+    out.src = {ptr, Mem::MEM1_SIZE - p.ram_addr};
   }
-
+  out.w1 = p.w1;
+  out.h1 = p.h1;
   if (mip) {
-    int mw = w1 + 1, mh = h1 + 1;
-    int bw = (int)BlockWidth(fmt), bh = (int)BlockHeight(fmt);
-    u32 bpt = BitsPerTexel(fmt);
-    w1 >>= mip;
-    h1 >>= mip;
-    s >>= mip;
-    t >>= mip;
+    int mw = p.w1 + 1, mh = p.h1 + 1;
+    int bw = (int)BlockWidth(p.fmt), bh = (int)BlockHeight(p.fmt);
+    u32 bpt = BitsPerTexel(p.fmt);
+    out.w1 >>= mip;
+    out.h1 >>= mip;
     for (int m = 0; m < mip; m++) {
       mw = std::max(mw, bw);
       mh = std::max(mh, bh);
       u32 bytes = (u32)(((mw + bw - 1) / bw * bw) * ((mh + bh - 1) / bh * bh)) * bpt / 8;
-      if (bytes >= src.size) {
-        src.size = 0;
+      if (bytes >= out.src.size) {
+        out.src.size = 0;
         break;
       }
-      src.p += bytes;
-      src.size -= bytes;
+      out.src.p += bytes;
+      out.src.size -= bytes;
       mw >>= 1;
       mh >>= 1;
     }
   }
-  u32 wrap_s = Bits(mode0, 0, 2), wrap_t = Bits(mode0, 2, 2);
-  bool tmem_rgba8 = from_tmem && fmt == RGBA8;
+  return true;
+}
 
-  auto fetch = [&](int x, int y, u8* o) {
-    x = Wrap(x, wrap_s, w1 + 1);
-    y = Wrap(y, wrap_t, h1 + 1);
-    if (tmem_rgba8)
-      DecodeRGBA8FromTMEM(src.p, odd, x, y, w1, o);
-    else
-      DecodeTexel(src, x, y, w1, fmt, tlut, tlut_fmt, o);
-  };
+constexpr int MAX_LEVELS = 11;
 
+struct TexEntry {
+  u32 img0, img1, img2, img3, tlutr;
+  u32 tlut_hash;
+  u32 stamp;      // Mem write stamp at decode time
+  u32 tmem_gen;   // TMEM generation at decode time
+  u32 src_bytes;  // RAM bytes covered by the decoded levels
+  int levels;     // decoded levels
+  bool valid;
+  u32 last_use;
+  std::vector<u8> data;  // RGBA bytes, levels back to back
+  u32 level_offset[MAX_LEVELS];
+  int level_w[MAX_LEVELS], level_h[MAX_LEVELS];
+};
+
+struct BoundTexture {
+  const TexEntry* e;  // nullptr: unmapped texture (samples read 0)
+  u32 wrap_s, wrap_t;
+  u32 mip_filter;
+};
+
+std::vector<std::unique_ptr<TexEntry>>* s_cache = nullptr;
+size_t s_cache_bytes = 0;
+u32 s_tmem_gen = 1;
+u32 s_use_counter = 0;
+BoundTexture s_bound[8];
+constexpr size_t CACHE_BUDGET = 24u << 20;
+
+u32 HashBytes(const u8* p, u32 n) {
+  u32 h = 2166136261u;
+  for (u32 i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
+  return h;
+}
+
+u32 PaletteEntries(u32 fmt) {
+  switch (fmt) {
+    case C4: return 16;
+    case C8: return 256;
+    case C14X2: return 16384;
+    default: return 0;
+  }
+}
+
+void DecodeLevel(u32 texmap, const TexParams& p, int mip, u8* out, int w, int h) {
+  LevelSource ls;
+  if (!GetLevelSource(texmap, p, mip, ls)) {
+    memset(out, 0, (size_t)w * h * 4);
+    return;
+  }
+  bool tmem_rgba8 = p.from_tmem && p.fmt == RGBA8;
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++) {
+      u8* o = out + ((size_t)y * w + x) * 4;
+      if (tmem_rgba8)
+        DecodeRGBA8FromTMEM(ls.src.p, ls.odd, x, y, ls.w1, o);
+      else
+        DecodeTexel(ls.src, x, y, ls.w1, p.fmt, p.tlut, p.tlut_fmt, o);
+    }
+}
+
+// RAM bytes used by levels [0, levels)
+u32 SourceBytes(const TexParams& p, int levels) {
+  int mw = p.w1 + 1, mh = p.h1 + 1;
+  int bw = (int)BlockWidth(p.fmt), bh = (int)BlockHeight(p.fmt);
+  u32 bpt = BitsPerTexel(p.fmt), total = 0;
+  for (int m = 0; m < levels; m++) {
+    mw = std::max(mw, bw);
+    mh = std::max(mh, bh);
+    total += (u32)(((mw + bw - 1) / bw * bw) * ((mh + bh - 1) / bh * bh)) * bpt / 8;
+    mw >>= 1;
+    mh >>= 1;
+  }
+  return total;
+}
+
+void BindTexture(u32 texmap) {
+  BoundTexture& b = s_bound[texmap];
+  u32 mode0 = g_bp[TexReg(0x80, texmap)], mode1 = g_bp[TexReg(0x84, texmap)];
+  b.wrap_s = Bits(mode0, 0, 2);
+  b.wrap_t = Bits(mode0, 2, 2);
+  b.mip_filter = Bits(mode0, 5, 2);
+  b.e = nullptr;
+  TexParams p = GetParams(texmap);
+  if (!p.from_tmem && !Mem::PhysPtr(p.ram_addr, 1)) return;
+
+  int levels = 1;
+  if (b.mip_filter != 0) levels = std::min(MAX_LEVELS, (int)(Bits(mode1, 8, 8) >> 4) + 2);
+  u32 img0 = g_bp[TexReg(0x88, texmap)], img1 = g_bp[TexReg(0x8C, texmap)];
+  u32 img2 = g_bp[TexReg(0x90, texmap)], img3 = g_bp[TexReg(0x94, texmap)];
+  u32 tlutr = g_bp[TexReg(0x98, texmap)];
+  u32 pal = PaletteEntries(p.fmt);
+  u32 tlut_hash = 0;
+  if (pal) {
+    u32 off = (u32)(p.tlut - s_tmem);
+    tlut_hash = HashBytes(p.tlut, std::min<u32>(pal * 2, TMEM_SIZE - off));
+  } else {
+    tlutr = 0;  // the palette does not matter for direct formats
+  }
+  if (!p.from_tmem) img1 &= 1u << 21, img2 = 0;  // TMEM placement irrelevant for RAM textures
+  u32 src_bytes = p.from_tmem ? 0 : SourceBytes(p, levels);
+
+  TexEntry* hit = nullptr;
+  for (auto& ep : *s_cache) {
+    TexEntry& e = *ep;
+    if (e.img3 == img3 && e.img0 == img0 && e.img1 == img1 && e.img2 == img2 && e.tlutr == tlutr &&
+        e.tlut_hash == tlut_hash) {
+      hit = &e;
+      break;
+    }
+  }
+  if (hit) {
+    bool fresh = hit->levels >= levels &&
+                 (p.from_tmem ? hit->tmem_gen == s_tmem_gen
+                              : Mem::UnchangedSince(p.ram_addr, hit->src_bytes, hit->stamp));
+    if (fresh) {
+      hit->last_use = ++s_use_counter;
+      b.e = hit;
+      return;
+    }
+  } else {
+    s_cache->push_back(std::make_unique<TexEntry>());
+    hit = s_cache->back().get();
+  }
+  TexEntry& e = *hit;
+  e.img0 = img0, e.img1 = img1, e.img2 = img2, e.img3 = img3, e.tlutr = tlutr, e.tlut_hash = tlut_hash;
+  e.stamp = Mem::NewStamp();
+  e.tmem_gen = s_tmem_gen;
+  e.src_bytes = src_bytes;
+  e.levels = levels;
+  e.valid = true;
+  e.last_use = ++s_use_counter;
+  size_t total = 0;
+  for (int l = 0; l < levels; l++) {
+    e.level_w[l] = (p.w1 >> l) + 1;
+    e.level_h[l] = (p.h1 >> l) + 1;
+    e.level_offset[l] = (u32)total;
+    total += (size_t)e.level_w[l] * e.level_h[l] * 4;
+  }
+  s_cache_bytes -= e.data.size();
+  e.data.resize(total);
+  s_cache_bytes += total;
+  for (int l = 0; l < levels; l++) DecodeLevel(texmap, p, l, e.data.data() + e.level_offset[l], e.level_w[l], e.level_h[l]);
+  b.e = hit;
+}
+
+void SampleMip(u32 texmap, s32 s, s32 t, s32 mip, bool linear, u8 out[4]) {
+  const BoundTexture& b = s_bound[texmap];
+  const TexEntry* e = b.e;
+  if (!e || mip >= e->levels) {
+    out[0] = out[1] = out[2] = out[3] = 0;
+    return;
+  }
+  int w = e->level_w[mip], h = e->level_h[mip];
+  const u8* data = e->data.data() + e->level_offset[mip];
+  if (mip) {
+    s >>= mip;
+    t >>= mip;
+  }
   if (linear) {
     s -= 64;
     t -= 64;
     int x0 = s >> 7, y0 = t >> 7;
     u32 fs = s & 0x7F, ft = t & 0x7F;
-    u8 a[4], b[4], c[4], d[4];
-    fetch(x0, y0, a);
-    fetch(x0 + 1, y0, b);
-    fetch(x0, y0 + 1, c);
-    fetch(x0 + 1, y0 + 1, d);
-    for (int i = 0; i < 4; i++) {
-      u32 v = a[i] * (128 - fs) * (128 - ft) + b[i] * fs * (128 - ft) + c[i] * (128 - fs) * ft + d[i] * fs * ft;
-      out[i] = (u8)(v >> 14);
-    }
+    int xa = Wrap(x0, b.wrap_s, w), xb = Wrap(x0 + 1, b.wrap_s, w);
+    int ya = Wrap(y0, b.wrap_t, h), yb = Wrap(y0 + 1, b.wrap_t, h);
+    const u8* a = data + ((size_t)ya * w + xa) * 4;
+    const u8* bb = data + ((size_t)ya * w + xb) * 4;
+    const u8* c = data + ((size_t)yb * w + xa) * 4;
+    const u8* d = data + ((size_t)yb * w + xb) * 4;
+    u32 w00 = (128 - fs) * (128 - ft), w10 = fs * (128 - ft), w01 = (128 - fs) * ft, w11 = fs * ft;
+    for (int i = 0; i < 4; i++) out[i] = (u8)((a[i] * w00 + bb[i] * w10 + c[i] * w01 + d[i] * w11) >> 14);
   } else {
-    fetch(s >> 7, t >> 7, out);
+    const u8* a = data + ((size_t)Wrap(t >> 7, b.wrap_t, h) * w + Wrap(s >> 7, b.wrap_s, w)) * 4;
+    memcpy(out, a, 4);
   }
 }
 
 }  // namespace
 
-void TextureDoState(StateBuffer& s) { s.DoBytes(s_tmem, TMEM_SIZE); }
+void TextureDoState(StateBuffer& s) {
+  s.DoBytes(s_tmem, TMEM_SIZE);
+  if (s.IsReading()) InvalidateTextureCache();
+}
+
+void InvalidateTextureCache() {
+  if (s_cache) s_cache->clear();
+  s_cache_bytes = 0;
+  s_tmem_gen++;
+  for (BoundTexture& b : s_bound) b.e = nullptr;
+}
+
+void BindTextures(u32 mask) {
+  if (!s_cache) s_cache = new std::vector<std::unique_ptr<TexEntry>>();
+  if (s_cache_bytes > CACHE_BUDGET) {  // simple policy: start over (nothing is bound yet)
+    s_cache->clear();
+    s_cache_bytes = 0;
+  }
+  for (u32 t = 0; t < 8; t++) s_bound[t].e = nullptr;
+  for (u32 t = 0; t < 8; t++)
+    if (mask & (1u << t)) BindTexture(t);
+}
 
 void TextureReset() {
   if (!s_tmem) s_tmem = (u8*)calloc(1, TMEM_SIZE);
   memset(s_tmem, 0, TMEM_SIZE);
+  InvalidateTextureCache();
 }
 
 void SampleTexture(u32 texmap, s32 s, s32 t, s32 lod, bool linear, u8 out[4]) {
@@ -303,10 +497,12 @@ void LoadTLUT(u32 value) {
   const u8* p = Mem::PhysPtr(src, bytes);
   if (!p || tmem_addr + bytes > TMEM_SIZE) return;
   memcpy(s_tmem + tmem_addr, p, bytes);
+  s_tmem_gen++;
 }
 
 void PreloadTMEM(u32 value) {
   if (!value) return;
+  s_tmem_gen++;
   u32 src = (g_bp[0x60] << 5) & 0x01FFFFFF;
   u32 even = Bits(g_bp[0x61], 0, 15) * TMEM_LINE, odd = Bits(g_bp[0x62], 0, 15) * TMEM_LINE;
   u32 count = Bits(value, 0, 15), type = Bits(value, 15, 2);

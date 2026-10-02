@@ -43,6 +43,7 @@ void ExecuteCommand() {
         u8* dst = Mem::PhysPtr(s_mar, s_length);
         if (!dst || !ReadDisc(offset, dst, s_length)) error = true;
         BlockCache::Invalidate(s_mar, s_length);
+        Mem::MarkWritten(s_mar, s_length);
         s_mar += s_length;
         s_length = 0;
       } else {
@@ -59,6 +60,7 @@ void ExecuteCommand() {
         StoreBE16(dst + 2, 0x0002);
         StoreBE16(dst + 4, 0x0606);
         StoreBE32(dst + 6, 0x20010608);
+        Mem::MarkWritten(s_mar, 32);
       }
       s_length = 0;
       break;

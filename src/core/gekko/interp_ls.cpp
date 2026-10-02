@@ -228,6 +228,7 @@ void dcbz(u32 i) {
   if (Mem::TranslateData(ea, pa)) {
     if (u8* p = Mem::PhysPtr(pa, 32)) {
       memset(p, 0, 32);
+      Mem::MarkWritten(pa, 32);
       return;
     }
   }

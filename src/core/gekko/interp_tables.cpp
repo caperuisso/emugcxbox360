@@ -41,7 +41,10 @@ void LockedCacheDMA(u32 dmal) {
   if (dmal & 0x10)
     memcpy(cache, ram, len);  // load into locked cache
   else
+  {
     memcpy(ram, cache, len);  // store from locked cache
+    Mem::MarkWritten(mem_addr, len);
+  }
 }
 }  // namespace
 

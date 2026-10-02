@@ -164,7 +164,10 @@ void StartTransfer(int ch) {
   if (c.cr & 2) {  // DMA
     u32 len = c.length & ~31u;
     u8* mem = Mem::PhysPtr(c.mar & 0x03FFFFE0, len);
-    if (mem && rw == 0) BlockCache::Invalidate(c.mar & 0x03FFFFE0, len);
+    if (mem && rw == 0) {
+      BlockCache::Invalidate(c.mar & 0x03FFFFE0, len);
+      Mem::MarkWritten(c.mar & 0x03FFFFE0, len);
+    }
     if (mem) {
       for (u32 k = 0; k < len; k++) {
         if (rw == 0)

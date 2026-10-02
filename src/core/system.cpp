@@ -72,7 +72,9 @@ bool Boot(const std::string& path) {
   HW::Reset();
   BootCheckpoint("HW::Reset");
   HLE::Clear();
-  return Boot::BootFile(path);
+  bool ok = Boot::BootFile(path);
+  Mem::MarkWritten(0, Mem::MEM1_SIZE);  // loaders write RAM directly
+  return ok;
 }
 
 namespace {
