@@ -1,1 +1,0 @@
-/usr/bin/c++ -pg -O2 -fno-omit-frame-pointer -O3 -DNDEBUG -pg -Wl,--dependency-file=CMakeFiles/emugc.dir/link.d CMakeFiles/emugc.dir/src/platform/sdl/main_sdl.cpp.o -o emugc  libemucore.a /usr/lib/x86_64-linux-gnu/libSDL2.so

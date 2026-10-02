@@ -1,1 +1,0 @@
-/usr/bin/c++ -pg -O2 -fno-omit-frame-pointer -O3 -DNDEBUG -pg -Wl,--dependency-file=CMakeFiles/emugc_tests.dir/link.d CMakeFiles/emugc_tests.dir/tests/test_cpu.cpp.o -o emugc_tests  libemucore.a

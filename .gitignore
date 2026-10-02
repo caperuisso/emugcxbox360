@@ -8,3 +8,4 @@ build-xenon/
 *.ppm
 build_ppc/
 build_prof/
+build-prof/
