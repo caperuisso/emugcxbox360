@@ -14,6 +14,7 @@ extern "C" {
 #include <input/input.h>
 #include <libfat/fat.h>
 #include <ppc/cache.h>
+#include <ppc/timebase.h>
 #include <time/time.h>
 #include <usb/usbmain.h>
 #include <xenon_soc/xenon_power.h>
@@ -22,6 +23,7 @@ extern "C" {
 int bdev_enum(int handle, const char** name);
 }
 
+#include "core/memory.h"
 #include "core/system.h"
 
 namespace {
@@ -61,6 +63,32 @@ class XenonHost : public Host {
 
   void Log(const char* msg) override { printf("%s", msg); }
 
+  // ---- Performance overlay (tiny 3x5 font, drawn over the picture) ----
+  char overlay[32] = "";
+
+  void DrawOverlay() {
+    static const char kChars[] = "0123456789.% FPSD";
+    static const u16 kGlyphs[] = {  // 3x5 bitmaps, row-major, 15 bits
+        0x7B6F, 0x2C97, 0x73E7, 0x73CF, 0x5BC9, 0x79CF, 0x79EF, 0x7249, 0x7BEF, 0x7BCF,
+        0x0002, 0x52A5, 0x0000, 0x79E4, 0x7BE4, 0x79CF, 0x6B6E};
+    const int scale = 3, ox = 16, oy = 16;
+    int len = (int)strlen(overlay);
+    for (int y = oy - 4; y < oy + 5 * scale + 4; y++)
+      for (int x = ox - 4; x < ox + len * 4 * scale + 4; x++) PutPixel(x, y, 0);
+    for (int c = 0; c < len; c++) {
+      const char* pos = strchr(kChars, overlay[c]);
+      if (!pos) continue;
+      u16 g = kGlyphs[pos - kChars];
+      for (int r = 0; r < 5; r++)
+        for (int col = 0; col < 3; col++) {
+          if (!(g & (1 << (14 - (r * 3 + col))))) continue;
+          for (int dy = 0; dy < scale; dy++)
+            for (int dx = 0; dx < scale; dx++)
+              PutPixel(ox + (c * 4 + col) * scale + dx, oy + r * scale + dy, 0xFFFFFF00);
+        }
+    }
+  }
+
   std::string memcard_dir;  // e.g. "uda0:/gc/"
   std::string MemcardPath(int slot) override {
     if (slot != 0 || memcard_dir.empty()) return std::string();
@@ -92,6 +120,7 @@ class XenonHost : public Host {
         PutPixel(off_x + x, off_y + y, bgrx);
       }
     }
+    if (overlay[0]) DrawOverlay();
     memdcbst(fb, fb_pitch_w * (((fb_h + 31) >> 5) << 5) * 4);
   }
 
@@ -263,9 +292,24 @@ int main() {
   console_clrscr();  // black screen: no leftover text around the emulated picture
   console_close();   // the emulated picture owns the framebuffer from now on
 
+  u64 stats_start = mftb();
+  int stats_fields = 0;
   for (;;) {
     usb_do_poll();
     System::RunFrame();
+    stats_fields++;
+    u64 now = mftb();
+    if (tb_diff_msec(now, stats_start) >= 1000) {
+      // Emulated speed relative to the console's field rate (50 Hz PAL, 60 Hz NTSC).
+      unsigned ms = tb_diff_msec(now, stats_start);
+      int field_rate = Mem::PhysRead32(0xCC) == 1 ? 50 : 60;
+      int fps10 = (int)(stats_fields * 10000u / ms);
+      int speed = fps10 * 10 / field_rate;
+      snprintf(host.overlay, sizeof(host.overlay), "FPS %d.%d SPD %d%%", fps10 / 10, fps10 % 10, speed);
+      printf("[perf] %s\n", host.overlay);  // also on the UART
+      stats_start = now;
+      stats_fields = 0;
+    }
     struct controller_data_s c;
     memset(&c, 0, sizeof(c));
     get_controller_data(&c, 0);
