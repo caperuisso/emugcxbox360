@@ -5,24 +5,23 @@ Le cœur est portable : il se compile aussi sur Linux (frontend SDL2) pour déve
 
 Licence : GPL-2.0-or-later. Le code est écrit pour ce projet en s'appuyant sur la documentation publique du matériel (YAGCD) et sur le comportement de Dolphin (GPL), dont il peut reprendre du code à l'avenir.
 
-## État : jalon 1
+## État
 
 | Bloc | État |
 |---|---|
-| CPU Gekko (interpréteur) | Jeu d'instructions complet : entiers, branches, load/store, FPU, paired singles, `psq_l/st` quantifiés, exceptions, décrémenteur, timebase, DMA du cache verrouillé |
-| Mémoire | MEM1 24 Mo, traduction BAT (tables par blocs de 128 Ko), cache L2 verrouillé, MMIO, write-gather pipe |
-| VI | Compteur de lignes, interruptions d'affichage, scan-out XFB (YUV 4:2:2 → RGB), entrelacé/progressif |
-| PI / MI | Contrôleur d'interruptions, FIFO CPU |
-| SI | Manette standard (type, origine, poll direct et polling automatique) |
-| EXI | IPL : RTC + SRAM ; pas encore de carte mémoire |
-| DI | Lecture disque, inquiry, interruptions. Formats : ISO/GCM, RVZ et WIA de Dolphin (zstd ou sans compression ; GameCube uniquement) |
-| DSP / ARAM / AI | ARAM 16 Mo + DMA, DMA audio vers l'hôte, compteur d'échantillons AI. **Le DSP lui-même n'est pas émulé** (mailboxes inertes) |
-| GX (CP/PE) | Parseur du FIFO (tailles de vertex, display lists, registres BP), tokens et draw-done, copie EFB→XFB à la couleur d'effacement. **Pas encore de rendu 3D** |
-| Boot | DOL direct ; ISO/GCM/RVZ/WIA via apploader émulé (HLE de l'IPL, pas de BIOS requis) |
+| CPU Gekko | Interpréteur complet (entiers, branches, load/store, FPU, paired singles, `psq_l/st`, exceptions, décrémenteur, timebase, cache verrouillé) + cache de blocs pré-décodés + saut des boucles d'attente (idle skipping) |
+| Mémoire | MEM1 24 Mo, traduction BAT, cache L2 verrouillé, MMIO, write-gather pipe, accès CPU à l'EFB |
+| VI | Compteur de lignes, interruptions d'affichage, état laissé par le BIOS (PAL/NTSC selon le disque), scan-out XFB |
+| SI | Manette standard |
+| EXI | IPL (RTC + SRAM avec flash ID), **carte mémoire slot A** (image `.raw` de 59 blocs créée et formatée automatiquement) |
+| DI | Lecture disque. Formats : ISO/GCM, RVZ et WIA de Dolphin (zstd ou sans compression ; GameCube uniquement) |
+| DSP | Microcodes en HLE : ROM, INIT, CARD, GBA, **Zelda** (son complet : AFC/PCM, filtres, Dolby, réverb) et **AX** (son complet : ADPCM, rééchantillonnage, bus AUX, compresseur) |
+| GX | **Rendu 3D logiciel complet** : chargeur de sommets (tous formats), transformation + éclairage 8 lumières, génération de coordonnées, clipping, rasterisation perspective, TEV 16 étages (indirect, fog, z-texture), tous les formats de texture, mipmaps, EFB (blend, logic ops, formats), copies vers XFB et vers textures. Rasterisation multi-thread |
+| Divers | Save states (déterministes au bit près), HLE de fonctions (OSReport) |
 
-Concrètement, les homebrews qui dessinent directement dans l'XFB (console libogc, démos 2D logicielles) peuvent tourner. Les jeux commerciaux bootent leur code mais n'affichent rien tant que le rendu GX (jalon 2) et le DSP (jalon 3) manquent.
+Testé avec *The Legend of Zelda: The Wind Waker* (PAL, RVZ) : écran titre rendu correctement avec sa musique, création de sauvegarde sur la carte mémoire, menu de sélection de fichier.
 
-L'interpréteur tourne à environ 50 MIPS sur un PC récent, alors que le Gekko en fait environ 486. La vitesse réelle viendra du JIT (jalon 4).
+Limites actuelles : pas encore de JIT (la vitesse plein régime n'est pas atteinte, surtout sur 360), pas de rendu GPU sur Xenos (rendu logiciel uniquement), pas de MMU par tables de pages (quelques jeux Star Wars), son AX non testé faute de jeu AX disponible.
 
 ## Compiler sur Linux (SDL2)
 
@@ -42,7 +41,7 @@ Pour vérifier une image disque (format, ID du jeu, CRC32/SHA-1 à comparer avec
 
 Les RVZ compressés en bzip2/LZMA (option non standard de Dolphin) ne sont pas gérés : reconvertis-les en zstd ou en ISO avec `dolphin-tool convert`.
 
-Options : `--headless`, `--frames N`, `--dump image.ppm`, `--cpi N` (cycles par instruction), `--unthrottled`, `--scale N`.
+Options utiles : `--headless`, `--frames N`, `--dump image.ppm` (`--dump-every N`), `--wav son.wav`, `--memcard fichier.raw|none`, `--save-state N:fichier`, `--load-state fichier`, `--input 1000:start:10,1400:sleft:20` (entrées scriptées), `--threads N`, `--stats`, `--osreport ADDR`, `--interpreter`, `--unthrottled`, `--scale N`. Touches F1/F3 : sauvegarde/chargement rapide.
 
 Clavier → manette GameCube : X=A, Z=B, C=X, S=Y, Entrée=Start, D=Z, Q/W=L/R, flèches=stick, IJKL=C-stick, TFGH=croix. Une manette Xbox branchée en USB est aussi reconnue.
 
@@ -67,7 +66,7 @@ Clavier → manette GameCube : X=A, Z=B, C=X, S=Y, Entrée=Start, D=Z, Q/W=L/R, 
    ```
 3. Copier `emugcxbox360.elf32` sur une clé USB (FAT32) avec tes `.dol`/`.iso`/`.gcm`/`.rvz` à la racine ou dans `/gc/`, puis lancer l'elf depuis XeLL.
 
-Sur la 360 : stick/croix pour choisir, A pour lancer, bouton Guide pour revenir à XeLL. Mapping en jeu : A=A, X=B, B=X, Y=Y, RB=Z, gâchettes=L/R.
+Sur la 360 : stick/croix pour choisir, A pour lancer, X pour activer le rendu multi-thread (expérimental), bouton Guide pour revenir à XeLL. Mapping en jeu : A=A, X=B, B=X, Y=Y, RB=Z, gâchettes=L/R. La carte mémoire `memcard_a.raw` est créée à côté du jeu. Un compteur FPS / vitesse (%) s'affiche en haut à gauche et sur le port série.
 
 ## Organisation
 
