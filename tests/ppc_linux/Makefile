@@ -8,8 +8,8 @@ CXX     := $(PREFIX)g++
 CC      := $(PREFIX)gcc
 OUT     := build_ppc
 ARCH    := -m32 -mcpu=7450 -mno-powerpc64 -maltivec -mhard-float -fno-pic
-CXXFLAGS := -O2 -fno-strict-aliasing -std=gnu++17 $(ARCH) -Isrc -Ithird_party
-CFLAGS   := -O2 $(ARCH) -Ithird_party
+CXXFLAGS := -O2 $(EXTRA) -fno-strict-aliasing -std=gnu++17 $(ARCH) -Isrc -Ithird_party
+CFLAGS   := -O2 $(EXTRA) $(ARCH) -Ithird_party
 
 CORE := $(shell find src/core -name '*.cpp' -not -path 'src/core/jit/*')
 OBJS := $(patsubst %.cpp,$(OUT)/%.o,$(CORE) tests/headless_main.cpp) \
