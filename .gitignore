@@ -6,3 +6,4 @@ build-xenon/
 *.iso
 *.gcm
 *.ppm
+build_ppc/

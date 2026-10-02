@@ -25,3 +25,6 @@ target_link_libraries(emugc_disctool PRIVATE emucore)
 
 enable_testing()
 add_test(NAME cpu COMMAND emugc_tests)
+
+add_executable(emugc_headless tests/headless_main.cpp)
+target_link_libraries(emugc_headless PRIVATE emucore)
