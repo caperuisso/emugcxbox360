@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "core/memory.h"
@@ -285,6 +286,7 @@ struct BoundTexture {
 };
 
 std::vector<std::unique_ptr<TexEntry>>* s_cache = nullptr;
+std::unordered_map<u64, std::vector<TexEntry*>>* s_index = nullptr;  // key hash -> entries
 size_t s_cache_bytes = 0;
 u32 s_tmem_gen = 1;
 u32 s_use_counter = 0;
@@ -366,13 +368,16 @@ void BindTexture(u32 texmap) {
   u32 src_bytes = p.from_tmem ? 0 : SourceBytes(p, levels);
 
   TexEntry* hit = nullptr;
-  for (auto& ep : *s_cache) {
-    TexEntry& e = *ep;
-    if (e.img3 == img3 && e.img0 == img0 && e.img1 == img1 && e.img2 == img2 && e.tlutr == tlutr &&
-        e.tlut_hash == tlut_hash) {
-      hit = &e;
-      break;
-    }
+  u64 key = ((u64)img3 << 32) ^ ((u64)img0 * 0x9E3779B97F4A7C15ull) ^ ((u64)img1 << 7) ^ ((u64)img2 << 19) ^
+            ((u64)tlutr << 41) ^ ((u64)tlut_hash * 0xC2B2AE3D27D4EB4Full);
+  auto found = s_index->find(key);
+  if (found != s_index->end()) {
+    for (TexEntry* e : found->second)
+      if (e->img3 == img3 && e->img0 == img0 && e->img1 == img1 && e->img2 == img2 && e->tlutr == tlutr &&
+          e->tlut_hash == tlut_hash) {
+        hit = e;
+        break;
+      }
   }
   if (hit) {
     bool fresh = hit->levels >= levels &&
@@ -386,6 +391,7 @@ void BindTexture(u32 texmap) {
   } else {
     s_cache->push_back(std::make_unique<TexEntry>());
     hit = s_cache->back().get();
+    (*s_index)[key].push_back(hit);
   }
   TexEntry& e = *hit;
   e.img0 = img0, e.img1 = img1, e.img2 = img2, e.img3 = img3, e.tlutr = tlutr, e.tlut_hash = tlut_hash;
@@ -450,6 +456,7 @@ void TextureDoState(StateBuffer& s) {
 }
 
 void InvalidateTextureCache() {
+  if (s_index) s_index->clear();
   if (s_cache) s_cache->clear();
   s_cache_bytes = 0;
   s_tmem_gen++;
@@ -473,7 +480,9 @@ void GetGpuTexture(u32 texmap, GpuTexture& out) {
 
 void BindTextures(u32 mask) {
   if (!s_cache) s_cache = new std::vector<std::unique_ptr<TexEntry>>();
+  if (!s_index) s_index = new std::unordered_map<u64, std::vector<TexEntry*>>();
   if (s_cache_bytes > CACHE_BUDGET) {  // simple policy: start over (nothing is bound yet)
+    s_index->clear();
     s_cache->clear();
     s_cache_bytes = 0;
   }

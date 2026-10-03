@@ -12,5 +12,8 @@ namespace XenosSim {
 
 // Installs a simulated Xenos backend as Video::g_gpu.
 void Install();
+// Installs a backend that translates every draw (like the Xenos backend) but
+// draws nothing: measures the CPU side of the GPU path.
+void InstallNull();
 
 }  // namespace XenosSim

@@ -476,4 +476,32 @@ class SimBackend : public Video::GpuBackend {
 
 void Install() { Video::g_gpu = new SimBackend(); }
 
+namespace {
+class NullBackend : public Video::GpuBackend {
+ public:
+  void Draw(const Video::GpuDrawState& st, const Video::GpuVertex* v, u32 count) override {
+    XenosGx::Prepare(st, v, count, m_pd);
+  }
+  void ClearEFB(int x0, int y0, int x1, int y1, bool color, bool alpha, bool depth, u32 rgba, u32 z24) override {
+    XenosGx::PrepareClear(x0, y0, x1, y1, color, alpha, depth, rgba, z24, m_pd);
+  }
+  void ReadEFB(u32* color, u32* depth) override {}
+  void ReadEFBRect(int, int, int, int, bool, bool, u32*, u32*) override {}
+  bool CopyToXFB(u32, int, int, int, int, int) override { return true; }
+  bool PresentXFB(u32, int width, int height) override {
+    if (g_host) {
+      m_frame.assign((size_t)width * height, 0xFF000000u);
+      g_host->PresentFrame(m_frame.data(), width, height);
+    }
+    return true;
+  }
+
+ private:
+  XenosGx::PreparedDraw m_pd;
+  std::vector<u32> m_frame;
+};
+}  // namespace
+
+void InstallNull() { Video::g_gpu = new NullBackend(); }
+
 }  // namespace XenosSim

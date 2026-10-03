@@ -714,6 +714,19 @@ void BeginDraw() {
   s_num_stages = Bits(genmode, 10, 4);
   s_num_ind = Bits(genmode, 16, 3);
   s_iref = g_bp[BP_IREF];
+  if (g_gpu) {
+    // The backend decodes the TEV itself: only the textures are needed here.
+    u32 tex_mask = 0;
+    for (u32 stage = 0; stage <= s_num_stages; stage++) {
+      u32 order = g_bp[BP_TREF + (stage >> 1)], shift = (stage & 1) ? 12 : 0;
+      if (Bits(order, shift + 6, 1)) tex_mask |= 1u << Bits(order, shift, 3);
+    }
+    for (u32 st = 0; st < s_num_ind; st++) tex_mask |= 1u << Bits(s_iref, st * 6, 3);
+    BindTextures(tex_mask);
+    s_tex_mask = tex_mask;
+    s_gpu_batch.clear();
+    return;
+  }
   LoadSwapTables();
   for (u32 stage = 0; stage <= s_num_stages; stage++) {
     StageConfig& c = s_stage[stage];

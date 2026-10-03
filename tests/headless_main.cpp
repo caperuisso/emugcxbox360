@@ -79,6 +79,7 @@ int main(int argc, char** argv) {
   HeadlessHost host;
   const char* gpu = getenv("EMUGC_GPU");
   if (gpu && !strcmp(gpu, "sim")) XenosSim::Install();  // GPU path through the Xenos simulator
+  if (gpu && !strcmp(gpu, "null")) XenosSim::InstallNull();  // translation only (profiling)
   const char* jit = getenv("EMUGC_JIT");
   if (jit && !strcmp(jit, "0")) Jit::SetEnabled(false);
   if (jit && !strcmp(jit, "noinline")) Jit::SetInlining(false);
