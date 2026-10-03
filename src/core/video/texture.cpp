@@ -289,6 +289,17 @@ std::vector<std::unique_ptr<TexEntry>>* s_cache = nullptr;
 std::unordered_map<u64, std::vector<TexEntry*>>* s_index = nullptr;  // key hash -> entries
 size_t s_cache_bytes = 0;
 u32 s_tmem_gen = 1;
+u32 s_cache_gen = 1;  // bumped whenever cache entries are freed
+// Last binding of each texture unit: when its registers, TMEM and the cache
+// are unchanged, the entry only needs its RAM freshness check.
+struct BindMemo {
+  u32 regs[7];
+  u32 tmem_gen, cache_gen;
+  u32 ram_addr;
+  bool from_tmem;
+  TexEntry* e;
+};
+BindMemo s_memo[8];
 u32 s_use_counter = 0;
 u32 s_version_counter = 0;
 BoundTexture s_bound[8];
@@ -341,6 +352,15 @@ u32 SourceBytes(const TexParams& p, int levels) {
   return total;
 }
 
+void Remember(BindMemo& memo, const u32 regs[7], const TexParams& p, TexEntry* e) {
+  memcpy(memo.regs, regs, sizeof(memo.regs));
+  memo.tmem_gen = s_tmem_gen;
+  memo.cache_gen = s_cache_gen;
+  memo.ram_addr = p.ram_addr;
+  memo.from_tmem = p.from_tmem;
+  memo.e = e;
+}
+
 void BindTexture(u32 texmap) {
   BoundTexture& b = s_bound[texmap];
   u32 mode0 = g_bp[TexReg(0x80, texmap)], mode1 = g_bp[TexReg(0x84, texmap)];
@@ -348,6 +368,16 @@ void BindTexture(u32 texmap) {
   b.wrap_t = Bits(mode0, 2, 2);
   b.mip_filter = Bits(mode0, 5, 2);
   b.e = nullptr;
+  u32 regs[7] = {mode0, mode1, g_bp[TexReg(0x88, texmap)], g_bp[TexReg(0x8C, texmap)], g_bp[TexReg(0x90, texmap)],
+                 g_bp[TexReg(0x94, texmap)], g_bp[TexReg(0x98, texmap)]};
+  BindMemo& memo = s_memo[texmap];
+  if (memo.e && memo.tmem_gen == s_tmem_gen && memo.cache_gen == s_cache_gen && !memcmp(memo.regs, regs, sizeof(regs)) &&
+      (memo.from_tmem || Mem::UnchangedSince(memo.ram_addr, memo.e->src_bytes, memo.e->stamp))) {
+    memo.e->last_use = ++s_use_counter;
+    b.e = memo.e;
+    return;
+  }
+  memo.e = nullptr;
   TexParams p = GetParams(texmap);
   if (!p.from_tmem && !Mem::PhysPtr(p.ram_addr, 1)) return;
 
@@ -386,6 +416,7 @@ void BindTexture(u32 texmap) {
     if (fresh) {
       hit->last_use = ++s_use_counter;
       b.e = hit;
+      Remember(memo, regs, p, hit);
       return;
     }
   } else {
@@ -414,6 +445,7 @@ void BindTexture(u32 texmap) {
   s_cache_bytes += total;
   for (int l = 0; l < levels; l++) DecodeLevel(texmap, p, l, e.data.data() + e.level_offset[l], e.level_w[l], e.level_h[l]);
   b.e = hit;
+  Remember(memo, regs, p, hit);
 }
 
 void SampleMip(u32 texmap, s32 s, s32 t, s32 mip, bool linear, u8 out[4]) {
@@ -456,6 +488,7 @@ void TextureDoState(StateBuffer& s) {
 }
 
 void InvalidateTextureCache() {
+  s_cache_gen++;
   if (s_index) s_index->clear();
   if (s_cache) s_cache->clear();
   s_cache_bytes = 0;
@@ -482,6 +515,7 @@ void BindTextures(u32 mask) {
   if (!s_cache) s_cache = new std::vector<std::unique_ptr<TexEntry>>();
   if (!s_index) s_index = new std::unordered_map<u64, std::vector<TexEntry*>>();
   if (s_cache_bytes > CACHE_BUDGET) {  // simple policy: start over (nothing is bound yet)
+    s_cache_gen++;
     s_index->clear();
     s_cache->clear();
     s_cache_bytes = 0;

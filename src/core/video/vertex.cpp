@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // GPU register state, XF/CP/BP loads and the vertex loader.
 #include <cmath>
+#include <cstring>
 
 #include "core/memory.h"
 #include "core/state.h"
@@ -42,10 +43,8 @@ struct VertexFormat {
   float tc_scale[8];
 };
 
-VertexFormat GetFormat(u32 vat) {
+VertexFormat DecodeFormat(u32 vat, u32 lo, u32 hi, u32 a, u32 b, u32 c) {
   VertexFormat f;
-  u32 lo = g_cp[0x50], hi = g_cp[0x60];
-  u32 a = g_cp[0x70 + vat], b = g_cp[0x80 + vat], c = g_cp[0x90 + vat];
   f.pnmtx = lo & 1;
   f.texmtx_mask = (lo >> 1) & 0xFF;
   f.pos_mode = Bits(lo, 9, 2);
@@ -73,7 +72,27 @@ VertexFormat GetFormat(u32 vat) {
     f.tc_fmt[t] = fmt[t];
     f.tc_scale[t] = 1.0f / (float)(1u << frac[t]);
   }
+  (void)vat;
   return f;
+}
+
+// Decoded per VAT and kept while the CP registers it depends on are unchanged
+// (each primitive needs it twice: for its size, then to read it).
+const VertexFormat& GetFormat(u32 vat) {
+  struct Cached {
+    u32 key[5];
+    bool valid;
+    VertexFormat f;
+  };
+  static Cached cache[8];
+  Cached& e = cache[vat & 7];
+  u32 key[5] = {g_cp[0x50], g_cp[0x60], g_cp[0x70 + vat], g_cp[0x80 + vat], g_cp[0x90 + vat]};
+  if (!e.valid || memcmp(e.key, key, sizeof(key)) != 0) {
+    e.f = DecodeFormat(vat, key[0], key[1], key[2], key[3], key[4]);
+    memcpy(e.key, key, sizeof(key));
+    e.valid = true;
+  }
+  return e.f;
 }
 
 // Reads one component of an integer/float format and applies the fixed point scale.
@@ -189,7 +208,7 @@ void LoadIndexedXF(u32 array, u32 value) {
 }
 
 u32 VertexSize(u32 vat) {
-  VertexFormat f = GetFormat(vat);
+  const VertexFormat& f = GetFormat(vat);
   u32 size = f.pnmtx + __builtin_popcount(f.texmtx_mask);
   size += IndexSize(f.pos_mode, f.pos_comps * kFmtSize[f.pos_fmt]);
   if (f.nrm_mode) {
@@ -207,7 +226,7 @@ u32 VertexSize(u32 vat) {
 void Draw(u8 cmd, u32 count, const u8* data) {
   u32 vat = cmd & 7;
   u32 primitive = (cmd >> 3) & 7;
-  VertexFormat f = GetFormat(vat);
+  const VertexFormat& f = GetFormat(vat);
   u32 mia = g_xf[XF_MATRIX_INDEX_A], mib = g_xf[XF_MATRIX_INDEX_B];
   g_stats.primitives++;
   g_stats.vertices += count;
