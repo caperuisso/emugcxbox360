@@ -361,6 +361,8 @@ class XenosBackend : public Video::GpuBackend {
     }
     Xe_SetRenderTarget(s_xe, m_efb_rt);
     Xe_InvalidateState(s_xe);
+    m_rs_valid = false;
+    for (BoundTex& bt : m_bound) bt = BoundTex();
     Xe_SetCullMode(s_xe, XE_CULL_NONE);
     s_efb_active = true;
     if (m_efb_copy_valid) {
@@ -398,6 +400,7 @@ class XenosBackend : public Video::GpuBackend {
     Sync();  // nothing may still read the surfaces
     for (auto& kv : m_textures) Xe_DestroyTexture(s_xe, kv.second.surf);
     m_textures.clear();
+    for (BoundTex& bt : m_bound) bt = BoundTex();
   }
 
   static int Addressing(u32 gx_wrap) {
@@ -424,11 +427,17 @@ class XenosBackend : public Video::GpuBackend {
     Xe_VB_Unlock(s_xe, m_vb);
 
     const XenosGx::RenderState& rs = pd.rs;
-    Xe_SetZEnable(s_xe, rs.z_enable || rs.z_write);
-    Xe_SetZFunc(s_xe, rs.z_enable ? rs.z_func : 7);
-    Xe_SetZWrite(s_xe, rs.z_write);
-    Xe_SetBlendControl(s_xe, rs.color_src, rs.color_op, rs.color_dst, rs.alpha_src, rs.alpha_op, rs.alpha_dst);
-    Xe_SetScissor(s_xe, 1, rs.sc_left, rs.sc_top, rs.sc_right, rs.sc_bottom);
+    // Render state: only when it differs from the previous draw (each libxenon
+    // setter marks its register group for upload)
+    if (!m_rs_valid || memcmp(&rs, &m_rs, sizeof(rs)) != 0) {
+      Xe_SetZEnable(s_xe, rs.z_enable || rs.z_write);
+      Xe_SetZFunc(s_xe, rs.z_enable ? rs.z_func : 7);
+      Xe_SetZWrite(s_xe, rs.z_write);
+      Xe_SetBlendControl(s_xe, rs.color_src, rs.color_op, rs.color_dst, rs.alpha_src, rs.alpha_op, rs.alpha_dst);
+      Xe_SetScissor(s_xe, 1, rs.sc_left, rs.sc_top, rs.sc_right, rs.sc_bottom);
+      m_rs = rs;
+      m_rs_valid = true;
+    }
     Xe_SetShader(s_xe, SHADER_TYPE_PIXEL, ShaderObject(pd.ps), 0);
     Xe_SetShader(s_xe, SHADER_TYPE_VERTEX, ShaderObject(pd.vs), 0);
     // constants: only the used range, and only when they changed
@@ -441,10 +450,14 @@ class XenosBackend : public Video::GpuBackend {
     for (u32 t = 0; t < 8; t++) {
       if (!(pd.tex_mask & (1u << t)) || !tex || !tex[t].rgba) continue;
       XenosSurface* surf = Texture(tex[t]);
-      surf->use_filtering = tex[t].linear ? 1 : 0;
-      surf->u_addressing = Addressing(tex[t].wrap_s);
-      surf->v_addressing = Addressing(tex[t].wrap_t);
+      int filt = tex[t].linear ? 1 : 0, u = Addressing(tex[t].wrap_s), v = Addressing(tex[t].wrap_t);
+      BoundTex& bt = m_bound[t];
+      if (bt.surf == surf && bt.filt == filt && bt.u == u && bt.v == v) continue;
+      surf->use_filtering = filt;
+      surf->u_addressing = u;
+      surf->v_addressing = v;
       Xe_SetTexture(s_xe, t, surf);
+      bt = {surf, filt, u, v};
     }
     Xe_SetStreamSource(s_xe, 0, m_vb, m_vb_offset, pd.stride);
     int wptr = s_xe->rb_secondary_wptr;
@@ -462,6 +475,13 @@ class XenosBackend : public Video::GpuBackend {
   XfbCopy* m_xfb_shown = nullptr;
   XenosGx::PreparedDraw m_pd;
   float m_consts[XenosGx::NUM_PS_CONSTS][4];
+  XenosGx::RenderState m_rs;
+  bool m_rs_valid = false;
+  struct BoundTex {
+    XenosSurface* surf = nullptr;
+    int filt = -1, u = -1, v = -1;
+  };
+  BoundTex m_bound[8];
   u32 m_consts_valid = 0;  // leading constants known to be uploaded
   XenosSurface* m_efb_rt = nullptr;
   XenosSurface* m_efb_copy = nullptr;
