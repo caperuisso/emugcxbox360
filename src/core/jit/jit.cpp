@@ -297,6 +297,19 @@ bool EmitInline(PPCEmitter& e, u32 inst) {
       StoreGpr(e, 6, ra);
       if (rc) UpdateGuestCR(e, 0);
       return true;
+    case 8:   // subfic
+    case 12:  // addic
+    case 13:  // addic.
+      // XER.CA: guest XER -> host XER, run, host XER -> guest
+      LoadGpr(e, 3, ra);
+      e.lwz(0, OFF_XER, R_CPU);
+      e.mtxer(0);
+      e.Emit(WithField(WithField(inst, 21, 6), 16, 3));
+      e.mfxer(0);
+      e.stw(0, OFF_XER, R_CPU);
+      StoreGpr(e, 6, rd);
+      if (op == 13) UpdateGuestCR(e, 0);
+      return true;
     case 10:  // cmpli
     case 11:  // cmpi
     {
@@ -317,6 +330,52 @@ bool EmitInline(PPCEmitter& e, u32 inst) {
           e.Emit(WithField(WithField(WithField(inst, 21, 6), 16, 3), 11, 4));
           StoreGpr(e, 6, rd);
           if (rc) UpdateGuestCR(e, 0);
+          return true;
+        }
+        // carrying arithmetic (OE = 0): rD = f(rA, rB, CA)
+        case 10: case 138: case 8: case 136:     // addc, adde, subfc, subfe
+        case 202: case 234: case 200: case 232:  // addze, addme, subfze, subfme
+        {
+          LoadGpr(e, 3, ra);
+          LoadGpr(e, 4, rb);
+          e.lwz(0, OFF_XER, R_CPU);
+          e.mtxer(0);
+          e.Emit(WithField(WithField(WithField(inst, 21, 6), 16, 3), 11, 4));
+          e.mfxer(0);
+          e.stw(0, OFF_XER, R_CPU);
+          StoreGpr(e, 6, rd);
+          if (rc) UpdateGuestCR(e, 0);
+          return true;
+        }
+        case 792: case 824: {  // sraw, srawi: rA = f(rS, rB / sh), sets CA
+          LoadGpr(e, 3, rd);
+          if (xo == 792) LoadGpr(e, 4, rb);
+          e.lwz(0, OFF_XER, R_CPU);
+          e.mtxer(0);
+          u32 h = WithField(WithField(inst, 21, 3), 16, 6);
+          if (xo == 792) h = WithField(h, 11, 4);
+          e.Emit(h);
+          e.mfxer(0);
+          e.stw(0, OFF_XER, R_CPU);
+          StoreGpr(e, 6, ra);
+          if (rc) UpdateGuestCR(e, 0);
+          return true;
+        }
+        case 19:  // mfcr
+          e.lwz(6, OFF_CR, R_CPU);
+          StoreGpr(e, 6, rd);
+          return true;
+        case 144: {  // mtcrf
+          u32 crm = (inst >> 12) & 0xFF, mask = 0;
+          for (int f = 0; f < 8; f++)
+            if (crm & (0x80 >> f)) mask |= 0xF0000000u >> (4 * f);
+          LoadGpr(e, 3, rd);
+          e.lwz(4, OFF_CR, R_CPU);
+          e.LoadImm(5, mask);
+          e.Emit(PPCEmitter::X(31, 3, 3, 5, 28));   // and r3, r3, r5
+          e.Emit(PPCEmitter::X(31, 4, 4, 5, 60));   // andc r4, r4, r5
+          e.Emit(PPCEmitter::X(31, 3, 3, 4, 444));  // or r3, r3, r4
+          e.stw(3, OFF_CR, R_CPU);
           return true;
         }
         case 104: {  // neg
@@ -566,7 +625,65 @@ bool EmitPsqFast(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
   return true;
 }
 
+// Register moves and sign manipulation (raw bits), merges and frsp.
+bool EmitFpMove(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
+  if (inst & 1) return false;
+  u32 op = inst >> 26, xo = (inst >> 1) & 0x3FF;
+  u32 rd = Field(inst, 21), ra = Field(inst, 16), rb = Field(inst, 11);
+  auto fpr = [](u32 r, int half) { return OFF_FPR + (s32)r * 16 + half * 8; };
+  int kind;  // 0 mr, 1 neg, 2 abs, 3 nabs
+  bool pair;
+  if ((op == 63 || op == 4) && (xo == 72 || xo == 40 || xo == 264 || xo == 136)) {
+    kind = xo == 72 ? 0 : xo == 40 ? 1 : xo == 264 ? 2 : 3;
+    pair = op == 4;
+  } else if (op == 4 && (xo == 528 || xo == 560 || xo == 592 || xo == 624)) {
+    kind = -1;
+    pair = true;
+  } else if (op == 63 && xo == 12) {
+    kind = -2;  // frsp
+    pair = false;
+  } else {
+    return false;
+  }
+  e.lwz(0, OFF_MSR, R_CPU);
+  e.andi_(0, 0, MSR_FP);
+  slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+  if (kind == -2) {  // frsp: both halves = RoundSingle(B)
+    e.lfd(0, fpr(rb, 0), R_CPU);
+    e.Emit(PPCEmitter::X(63, 0, 0, 0, 12));
+    e.stfd(0, fpr(rd, 0), R_CPU);
+    e.stfd(0, fpr(rd, 1), R_CPU);
+    return true;
+  }
+  if (kind == -1) {  // ps_merge: ps0 from A (half a), ps1 from B (half b), read both first
+    int ha = (xo == 592 || xo == 624) ? 1 : 0, hb = (xo == 560 || xo == 624) ? 1 : 0;
+    e.lwz(3, fpr(ra, ha), R_CPU);
+    e.lwz(4, fpr(ra, ha) + 4, R_CPU);
+    e.lwz(5, fpr(rb, hb), R_CPU);
+    e.lwz(6, fpr(rb, hb) + 4, R_CPU);
+    e.stw(3, fpr(rd, 0), R_CPU);
+    e.stw(4, fpr(rd, 0) + 4, R_CPU);
+    e.stw(5, fpr(rd, 1), R_CPU);
+    e.stw(6, fpr(rd, 1) + 4, R_CPU);
+    return true;
+  }
+  for (int h = 0; h < (pair ? 2 : 1); h++) {
+    e.lwz(3, fpr(rb, h), R_CPU);  // high word holds the sign
+    e.lwz(4, fpr(rb, h) + 4, R_CPU);
+    switch (kind) {
+      case 1: e.xoris(3, 3, 0x8000); break;
+      case 2: e.rlwinm(3, 3, 0, 1, 31); break;
+      case 3: e.oris(3, 3, 0x8000); break;
+      default: break;
+    }
+    e.stw(3, fpr(rd, h), R_CPU);
+    e.stw(4, fpr(rd, h) + 4, R_CPU);
+  }
+  return true;
+}
+
 bool EmitFpFast(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
+  if (EmitFpMove(e, inst, slow)) return true;
   FpOp f;
   if ((inst & 1) || !DecodeFpOp(inst, f)) return false;  // Rc forms are left to the interpreter
   u32 rd = Field(inst, 21);
