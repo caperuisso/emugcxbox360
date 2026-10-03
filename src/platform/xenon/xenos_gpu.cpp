@@ -262,26 +262,27 @@ class XenosBackend : public Video::GpuBackend {
     slot->sx = sx, slot->sy = sy, slot->w = w, slot->h = h;
     Xe_ResolveInto(s_xe, slot->surf, XE_SOURCE_COLOR, 0);
     m_xfb_last = slot;
-    m_xfb_new = true;
     (void)out_h;
+    // Present now: the game has finished the frame. Presenting later from the
+    // VI (50/60 Hz, while the next frame is being drawn) would lose the EFB
+    // depth, since the screen picture goes through the same EDRAM.
+    Show(slot);
     return true;
   }
 
-  bool PresentXFB(u32 addr, int width, int height) override {
-    XfbCopy* f = nullptr;
-    for (XfbCopy& c : m_xfb)
-      if (c.surf && c.addr == addr) f = &c;
-    if (!f) f = m_xfb_last;
-    if (!f) return false;
-    // nothing new since the last present: the screen already shows it
-    if (f == m_xfb_shown && !m_xfb_new) return true;
-    m_xfb_shown = f;
-    m_xfb_new = false;
+  void Show(XfbCopy* f) {
     DrawPicture(f->surf, (float)f->sx / EFB_W, (float)f->sy / EFB_H, (float)(f->sx + f->w) / EFB_W,
                 (float)(f->sy + f->h) / EFB_H);
+    m_xfb_shown = f;
+  }
+
+  // Frames are shown when copied (see CopyToXFB); the VI only needs to know
+  // that the backend handles the display.
+  bool PresentXFB(u32 addr, int width, int height) override {
+    (void)addr;
     (void)width;
     (void)height;
-    return true;
+    return m_xfb_last != nullptr;
   }
 
   void ReadEFBRect(int x0, int y0, int x1, int y1, bool color, bool depth, u32* cbuf, u32* zbuf) override {
@@ -458,7 +459,6 @@ class XenosBackend : public Video::GpuBackend {
   int m_xfb_next = 0;
   XfbCopy* m_xfb_last = nullptr;
   XfbCopy* m_xfb_shown = nullptr;
-  bool m_xfb_new = false;
   XenosGx::PreparedDraw m_pd;
   float m_consts[XenosGx::NUM_PS_CONSTS][4];
   u32 m_consts_valid = 0;  // leading constants known to be uploaded
