@@ -207,6 +207,12 @@ constexpr int SYNC_COMMAND_DWORDS = (512 << 10) / 4;
 
 class XenosBackend : public Video::GpuBackend {
  public:
+  struct XfbCopy {
+    XenosSurface* surf = nullptr;
+    u32 addr = 0;
+    int sx = 0, sy = 0, w = 0, h = 0;
+  };
+
   bool Init() {
     m_efb_copy = Xe_CreateTexture(s_xe, EFB_W, EFB_H, 1, XE_FMT_8888 | XE_FMT_ARGB, 1);
     m_efb_copy->use_filtering = 0;
@@ -449,11 +455,6 @@ class XenosBackend : public Video::GpuBackend {
     m_vb_offset += (bytes + 31) & ~31u;
   }
 
-  struct XfbCopy {
-    XenosSurface* surf = nullptr;
-    u32 addr = 0;
-    int sx = 0, sy = 0, w = 0, h = 0;
-  };
   static constexpr int kXfbSlots = 3;
   XfbCopy m_xfb[kXfbSlots];
   int m_xfb_next = 0;
