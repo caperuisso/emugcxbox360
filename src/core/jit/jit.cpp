@@ -78,7 +78,9 @@ constexpr u32 R_STAMP = 24;  // Mem::g_page_stamp
 constexpr u32 R_MAP = 23;    // block cache map (physical word -> block id)
 constexpr u32 R_ENTRY = 22;  // block id -> generated code
 constexpr u32 R_IBAT = 21;   // instruction BAT table
-constexpr int FRAME = 64;    // r20-r31 saved at 12..56
+constexpr int FRAME = 96;    // r14-r31 saved at 16..84
+// Guest GPRs cached in host registers within a block
+constexpr u32 CACHE_FIRST = 14, CACHE_COUNT = 7;  // r14-r20
 
 constexpr s32 OFF_GPR = (s32)offsetof(CPUState, gpr);
 constexpr s32 OFF_PC = (s32)offsetof(CPUState, pc);
@@ -293,7 +295,7 @@ void Reset() {
   }
   e.lwz(0, FRAME + 4, 1);
   e.mtlr(0);
-  for (u32 r = 20; r <= 31; r++) e.lwz(r, 12 + (s32)(r - 20) * 4, 1);
+  for (u32 r = 14; r <= 31; r++) e.lwz(r, 16 + (s32)(r - 14) * 4, 1);
   e.addi(1, 1, FRAME);
   e.blr();
   // enter(): C entry point. Saves registers, loads the constants, then dispatches.
@@ -301,7 +303,7 @@ void Reset() {
   e.stwu(1, -FRAME, 1);
   e.mflr(0);
   e.stw(0, FRAME + 4, 1);
-  for (u32 r = 20; r <= 31; r++) e.stw(r, 12 + (s32)(r - 20) * 4, 1);
+  for (u32 r = 14; r <= 31; r++) e.stw(r, 16 + (s32)(r - 14) * 4, 1);
   e.LoadImm(R_CPU, Addr(&cpu));
   e.LoadImm(R_MEM1, Addr(Mem::g_mem1));
   e.LoadImm(R_DBAT, Addr(Mem::DataBatTable()));
@@ -329,8 +331,56 @@ void Reset() {
 
 // ---- Inlined instructions ----
 // Operands go to host r3 (first source), r4 (second source), result in r6.
-inline void LoadGpr(PPCEmitter& e, u32 h, u32 g) { e.lwz(h, Gpr(g), R_CPU); }
-inline void StoreGpr(PPCEmitter& e, u32 h, u32 g) { e.stw(h, Gpr(g), R_CPU); }
+// Register cache of the block being compiled: host register per guest GPR
+// (0 = in memory). Cached registers are loaded at block entry, written back
+// before anything that reads the CPU state (interpreter calls, exits) and
+// reloaded after interpreter calls.
+u32 s_cache[32];
+u32 s_cache_written;  // guest registers written in the block (bit mask)
+
+inline void LoadGpr(PPCEmitter& e, u32 h, u32 g) {
+  if (s_cache[g])
+    e.mr(h, s_cache[g]);
+  else
+    e.lwz(h, Gpr(g), R_CPU);
+}
+inline void StoreGpr(PPCEmitter& e, u32 h, u32 g) {
+  if (s_cache[g]) {
+    e.mr(s_cache[g], h);
+    s_cache_written |= 1u << g;
+  } else {
+    e.stw(h, Gpr(g), R_CPU);
+  }
+}
+void CacheWriteBack(PPCEmitter& e) {
+  for (u32 g = 0; g < 32; g++)
+    if (s_cache[g] && (s_cache_written & (1u << g))) e.stw(s_cache[g], Gpr(g), R_CPU);
+}
+void CacheReload(PPCEmitter& e) {
+  for (u32 g = 0; g < 32; g++)
+    if (s_cache[g]) e.lwz(s_cache[g], Gpr(g), R_CPU);
+}
+
+// Chooses the guest registers to cache: the most used ones (at least twice).
+void PlanCache(const u32* insts, u32 count) {
+  u32 uses[32] = {};
+  for (u32 k = 0; k < count; k++) {
+    u32 in = insts[k], op = in >> 26;
+    if (op == 16 || op == 18 || op == 17 || op == 19 || op == 1) continue;  // branches, sc, HLE
+    uses[(in >> 21) & 31]++;
+    uses[(in >> 16) & 31]++;
+    if (op == 31 || op == 4) uses[(in >> 11) & 31]++;
+  }
+  memset(s_cache, 0, sizeof(s_cache));
+  s_cache_written = 0;
+  for (u32 n = 0; n < CACHE_COUNT; n++) {
+    u32 best = 32, best_uses = 1;
+    for (u32 g = 0; g < 32; g++)
+      if (!s_cache[g] && uses[g] > best_uses) best = g, best_uses = uses[g];
+    if (best == 32) break;
+    s_cache[best] = CACHE_FIRST + n;
+  }
+}
 
 // Copies host cr0 (LT GT EQ) plus the guest XER.SO into guest CR field `f`.
 void UpdateGuestCR(PPCEmitter& e, u32 f) {
@@ -1121,6 +1171,10 @@ bool Compile(u32 id, const u32* insts, const Interpreter::OpFn* fns, u32 count) 
   };
   std::vector<u32> exhaust;  // budget exhausted after an inlined instruction -> exit
 
+  PlanCache(insts, count);
+  if (!s_inline_enabled) memset(s_cache, 0, sizeof(s_cache));
+  CacheReload(e);  // block entry
+
   bool ended = false;
   for (u32 k = 0; k < count && !ended; k++) {
     bool last = k + 1 == count;
@@ -1132,6 +1186,7 @@ bool Compile(u32 id, const u32* insts, const Interpreter::OpFn* fns, u32 count) 
       if (last && EmitBranch(e, insts[k])) {
         e.addi(R_PENDING, R_PENDING, 1);
         e.Emit(PPCEmitter::D(13, R_BUDGET, R_BUDGET, -1));  // addic. r30, r30, -1
+        CacheWriteBack(e);
         jump(s_dispatch);
         ended = true;
         continue;
@@ -1160,6 +1215,7 @@ bool Compile(u32 id, const u32* insts, const Interpreter::OpFn* fns, u32 count) 
     // Interpreted (or the slow path of a fast instruction)
     u32 slow_at = e.Here();
     for (u32 at : slow) e.PatchBranchTo(at, slow_at);
+    CacheWriteBack(e);  // the handler works on the CPU state in memory
     call(s_flush);
     e.LoadImm(3, insts[k]);
     e.CallAbs(Addr((const void*)fns[k]));
@@ -1170,16 +1226,24 @@ bool Compile(u32 id, const u32* insts, const Interpreter::OpFn* fns, u32 count) 
       ended = true;
     } else {
       jump_unless(PPCEmitter::BO_FALSE, PPCEmitter::CR0_LT, s_dispatch);  // lt: branch taken
+      CacheReload(e);  // the handler may have changed any register
     }
     if (has_fast_path) {
       e.PatchBranchTo(to_next, e.Here());
-      if (last) jump(s_dispatch);  // the fast path of the last instruction
+      if (last) {  // the fast path of the last instruction
+        CacheWriteBack(e);
+        jump(s_dispatch);
+      }
     }
   }
-  if (!ended) jump(s_dispatch);  // end of the block after an inlined instruction
+  if (!ended) {  // end of the block after an inlined instruction
+    CacheWriteBack(e);
+    jump(s_dispatch);
+  }
   if (!exhaust.empty()) {
     u32 at = e.Here();
     for (u32 x : exhaust) e.PatchBranchTo(x, at);
+    CacheWriteBack(e);  // every register written anywhere in the block (the others hold their memory value)
     jump(s_exit);
   }
 
