@@ -86,6 +86,7 @@ constexpr s32 OFF_SPR = (s32)offsetof(CPUState, spr);
 constexpr s32 OFF_CYC = (s32)offsetof(CPUState, cycles);  // big-endian u64: high word first
 constexpr s32 OFF_EXC = (s32)offsetof(CPUState, exceptions);
 constexpr s32 OFF_MSR = (s32)offsetof(CPUState, msr);
+constexpr s32 OFF_FPR = (s32)offsetof(CPUState, fpr);
 static_assert(OFF_SPR + 1024 * 4 < 32768, "CPU state offsets must fit a 16-bit displacement");
 
 inline s32 Gpr(u32 n) { return OFF_GPR + (s32)n * 4; }
@@ -373,10 +374,11 @@ bool s_inline_enabled = true;
 //   slow path -> the interpreter handler (falls through to the caller's code)
 struct MemOp {
   bool store;
-  u32 size;     // 1, 2, 4
+  u32 size;     // 1, 2, 4 (8 for lfd/stfd)
   bool sign;    // lha
   bool update;  // xxxu forms
   bool indexed;
+  u32 fp = 0;   // 0 integer, 1 single (lfs/stfs), 2 double (lfd/stfd)
 };
 
 bool DecodeMemOp(u32 inst, MemOp& m) {
@@ -397,6 +399,14 @@ bool DecodeMemOp(u32 inst, MemOp& m) {
     case 43: m = {false, 2, true, true, false}; return true;    // lhau
     case 44: m = {true, 2, false, false, false}; return true;   // sth
     case 45: m = {true, 2, false, true, false}; return true;    // sthu
+    case 48: m = {false, 4, false, false, false, 1}; return true;  // lfs
+    case 49: m = {false, 4, false, true, false, 1}; return true;   // lfsu
+    case 50: m = {false, 8, false, false, false, 2}; return true;  // lfd
+    case 51: m = {false, 8, false, true, false, 2}; return true;   // lfdu
+    case 52: m = {true, 4, false, false, false, 1}; return true;   // stfs
+    case 53: m = {true, 4, false, true, false, 1}; return true;    // stfsu
+    case 54: m = {true, 8, false, false, false, 2}; return true;   // stfd
+    case 55: m = {true, 8, false, true, false, 2}; return true;    // stfdu
     case 31:
       switch ((inst >> 1) & 0x3FF) {
         case 23: m = {false, 4, false, false, true}; return true;   // lwzx
@@ -412,6 +422,14 @@ bool DecodeMemOp(u32 inst, MemOp& m) {
         case 343: m = {false, 2, true, false, true}; return true;   // lhax
         case 407: m = {true, 2, false, false, true}; return true;   // sthx
         case 439: m = {true, 2, false, true, true}; return true;    // sthux
+        case 535: m = {false, 4, false, false, true, 1}; return true;  // lfsx
+        case 567: m = {false, 4, false, true, true, 1}; return true;   // lfsux
+        case 599: m = {false, 8, false, false, true, 2}; return true;  // lfdx
+        case 631: m = {false, 8, false, true, true, 2}; return true;   // lfdux
+        case 663: m = {true, 4, false, false, true, 1}; return true;   // stfsx
+        case 695: m = {true, 4, false, true, true, 1}; return true;    // stfsux
+        case 727: m = {true, 8, false, false, true, 2}; return true;   // stfdx
+        case 759: m = {true, 8, false, true, true, 2}; return true;    // stfdux
         default: return false;
       }
     default:
@@ -441,10 +459,19 @@ void EmitMemFast(PPCEmitter& e, u32 inst, const MemOp& m, std::vector<u32>& slow
       e.li(3, d);
     }
   }
-  // Data translation must be on (MSR.DR)
+  // Data translation must be on (MSR.DR); FP accesses also need MSR.FP
   e.lwz(0, OFF_MSR, R_CPU);
-  e.andi_(0, 0, MSR_DR);
-  slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+  if (m.fp) {
+    e.andi_(0, 0, MSR_DR | MSR_FP);
+    e.cmplwi(0, 0, MSR_DR | MSR_FP);
+    slow.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_EQ));
+    // natural alignment (the Xenon traps on unaligned FP accesses)
+    e.andi_(0, 3, m.size - 1);
+    slow.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_EQ));
+  } else {
+    e.andi_(0, 0, MSR_DR);
+    slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+  }
   // entry = dbat[ea >> 17]
   e.rlwinm(4, 3, 15, 15, 29);  // (ea >> 17) * 4
   e.lwzx(5, R_DBAT, 4);
@@ -455,7 +482,35 @@ void EmitMemFast(PPCEmitter& e, u32 inst, const MemOp& m, std::vector<u32>& slow
   e.rlwinm(7, 5, 9, 23, 31);  // pa >> 23
   e.cmplwi(0, 7, 3);
   slow.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_LT));
-  if (m.store) {
+  const s32 fpr = OFF_FPR + (s32)rd * 16;  // ps0, then ps1 at +8
+  if (m.store && m.fp == 2) {
+    e.lwz(6, fpr, R_CPU);
+    e.lwz(7, fpr + 4, R_CPU);
+    e.add(5, 5, R_MEM1);  // host address
+    e.stw(6, 0, 5);
+    e.stw(7, 4, 5);
+    e.Emit(PPCEmitter::XO(5, R_MEM1, 5, 40));  // subf r5, r_mem1, r5: back to pa
+  } else if (m.store && m.fp == 1) {
+    e.lfd(0, fpr, R_CPU);
+    e.Emit(PPCEmitter::X(63, 0, 0, 0, 12));  // frsp f0, f0
+    e.stfsx(0, R_MEM1, 5);
+  }
+  if (m.store && m.fp) {
+    e.LoadImm(8, Addr(&Mem::g_write_stamp));
+    e.lwz(8, 0, 8);
+    e.rlwinm(9, 5, 22, 10, 29);
+    e.stwx(8, R_STAMP, 9);
+  } else if (!m.store && m.fp == 2) {
+    e.add(5, 5, R_MEM1);
+    e.lwz(6, 0, 5);
+    e.lwz(7, 4, 5);
+    e.stw(6, fpr, R_CPU);
+    e.stw(7, fpr + 4, R_CPU);
+  } else if (!m.store && m.fp == 1) {
+    e.lfsx(0, R_MEM1, 5);
+    e.stfd(0, fpr, R_CPU);
+    e.stfd(0, fpr + 8, R_CPU);
+  } else if (m.store) {
     LoadGpr(e, 6, rd);
     u32 xo = m.size == 4 ? 151 : (m.size == 2 ? 407 : 215);  // stwx, sthx, stbx
     e.Emit(PPCEmitter::X(31, 6, R_MEM1, 5, xo));
