@@ -81,6 +81,7 @@ int main(int argc, char** argv) {
   if (gpu && !strcmp(gpu, "sim")) XenosSim::Install();  // GPU path through the Xenos simulator
   const char* jit = getenv("EMUGC_JIT");
   if (jit && !strcmp(jit, "0")) Jit::SetEnabled(false);
+  if (jit && !strcmp(jit, "noinline")) Jit::SetInlining(false);
   int fields = atoi(argv[2]);
   if (!System::Init(&host) || !System::Boot(argv[1])) {
     printf("boot failed\n");

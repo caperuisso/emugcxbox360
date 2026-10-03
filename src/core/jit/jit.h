@@ -17,6 +17,8 @@ using BlockFn = void (*)();
 // True when the host can run generated PowerPC code and the JIT is enabled.
 bool Enabled();
 void SetEnabled(bool on);
+// Inlining of simple instructions (on by default; off = every instruction calls the interpreter).
+void SetInlining(bool on);
 
 // Generated code size in bytes (statistics).
 size_t CodeBytes();

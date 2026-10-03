@@ -160,7 +160,10 @@ static void on_sigill(int sig, void* info, void* uctx) {
   g[32] += 4;
 }
 
+extern char** environ;
+
 void shim_start(int argc, char** argv) {
+  environ = argv + argc + 1;  /* envp follows argv on the initial stack */
   struct kernel_sigaction sa = {on_sigill, 4 /* SA_SIGINFO */, 0, {0, 0}};
   sys(173, 4 /* SIGILL */, (long)&sa, 0, 8, 0, 0);
   __libc_init_array();
