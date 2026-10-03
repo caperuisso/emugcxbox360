@@ -518,14 +518,16 @@ XenosBackend* s_backend = nullptr;
 }  // namespace
 
 void SaveEFBBeforePresent() {
-  if (s_backend) s_backend->SaveEFB();
+  if (!s_backend) return;
+  if (Video::g_gpu) Video::g_gpu->Flush();  // draws still held by the batching wrapper
+  s_backend->SaveEFB();
 }
 
 bool InstallBackend() {
   if (!s_xe) return false;
   s_backend = new XenosBackend();
   if (!s_backend->Init()) return false;
-  Video::g_gpu = s_backend;
+  Video::g_gpu = Video::WithDrawBatching(s_backend);
   return true;
 }
 

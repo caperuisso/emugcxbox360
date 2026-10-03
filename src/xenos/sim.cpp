@@ -474,7 +474,7 @@ class SimBackend : public Video::GpuBackend {
 
 }  // namespace
 
-void Install() { Video::g_gpu = new SimBackend(); }
+void Install() { Video::g_gpu = Video::WithDrawBatching(new SimBackend()); }
 
 namespace {
 class NullBackend : public Video::GpuBackend {
@@ -502,6 +502,6 @@ class NullBackend : public Video::GpuBackend {
 };
 }  // namespace
 
-void InstallNull() { Video::g_gpu = new NullBackend(); }
+void InstallNull() { Video::g_gpu = Video::WithDrawBatching(new NullBackend()); }
 
 }  // namespace XenosSim

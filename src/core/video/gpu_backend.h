@@ -62,9 +62,15 @@ class GpuBackend {
   // `width` x `height` picture (the VI's scan-out size, cropped/padded);
   // false when the backend has nothing for it.
   virtual bool PresentXFB(u32 addr, int width, int height) { return false; }
+  // Submits draws a wrapper still holds (see WithDrawBatching).
+  virtual void Flush() {}
 };
 
 // nullptr: the built-in software rasterizer is used.
 extern GpuBackend* g_gpu;
+
+// Wraps a backend so that consecutive draws with identical state reach it as
+// one draw (gpu_batch.cpp).
+GpuBackend* WithDrawBatching(GpuBackend* backend);
 
 }  // namespace Video
