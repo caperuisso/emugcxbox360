@@ -21,9 +21,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <algorithm>
 #include <map>
+#include <string>
+#include <vector>
 
 #include "core/coretiming.h"
+#include "core/gekko/cpu.h"
 #include "core/jit/ppc_emitter.h"
 #include "core/memory.h"
 
@@ -260,7 +264,7 @@ void EmitDispatch(PPCEmitter& e, std::vector<u32>& to_exit) {
   e.lwz(0, OFF_MSR, R_CPU);
   e.andi_(0, 0, MSR_IR);
   to_exit.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
-  e.rlwinm(4, R_PC, 15, 15, 29);  // (pc >> 17) * 4
+  e.rlwinm(4, R_PC, 17, 15, 29);  // (pc >> 17) * 4 (rotate right 15)
   e.lwzx(5, R_IBAT, 4);
   e.cmpwi(0, 5, 0);
   to_exit.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
@@ -676,6 +680,10 @@ bool EmitInline(PPCEmitter& e, u32 inst) {
           e.stw(3, spr == SPR_XER ? OFF_XER : OFF_SPR + (s32)spr * 4, R_CPU);
           return true;
         }
+        case 83:  // mfmsr (mtmsr stays interpreted: it may unmask a pending interrupt)
+          e.lwz(6, OFF_MSR, R_CPU);
+          StoreGpr(e, 6, rd);
+          return true;
         case 54: case 86: case 246: case 278: case 470: case 310: case 438:  // cache hints: no-ops
           return true;
         case 339: {  // mfspr without side effects (see Interpreter::ReadSPR)
@@ -858,7 +866,7 @@ bool EmitPsqFast(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
   e.cmplw(0, 0, 10);
   slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_GT));
   // translation
-  e.rlwinm(4, 3, 15, 15, 29);
+  e.rlwinm(4, 3, 17, 15, 29);
   e.lwzx(5, R_DBAT, 4);
   e.cmpwi(0, 5, 0);
   slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
@@ -1227,7 +1235,7 @@ void EmitMemFast(PPCEmitter& e, u32 inst, const MemOp& m, std::vector<u32>& slow
     slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
   }
   // entry = dbat[ea >> 17]
-  e.rlwinm(4, 3, 15, 15, 29);  // (ea >> 17) * 4
+  e.rlwinm(4, 3, 17, 15, 29);  // (ea >> 17) * 4
   e.lwzx(5, R_DBAT, 4);
   e.cmpwi(0, 5, 0);
   slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
@@ -1321,6 +1329,44 @@ void UnlinkAll() {
   u32 dispatch = Addr(s_code + s_dispatch);
   for (auto& kv : s_incoming)
     for (u32* site : kv.second) PatchBranch(site, dispatch);
+}
+
+// EMUGC_JIT_PROF=1: counts the instructions still run by the interpreter
+// (by name; "+slow" when the inline fast path bailed out), printed at exit.
+std::map<std::string, u64>* s_prof;
+void PrintProfile() {
+  std::vector<std::pair<u64, std::string>> v;
+  u64 total = 0;
+  for (auto& [name, n] : *s_prof) v.push_back({n, name}), total += n;
+  std::sort(v.rbegin(), v.rend());
+  printf("[jit] interpreted instructions: %llu\n", (unsigned long long)total);
+  for (size_t i = 0; i < v.size() && i < 30; i++) printf("[jit] %12llu %s\n", (unsigned long long)v[i].first, v[i].second.c_str());
+}
+void ProfiledCall(u32 inst, Interpreter::OpFn fn, u32 slow) {
+  std::string name = Interpreter::GetOpName(inst);
+  if (slow) {  // memory access: also the 1 MiB region of the address
+    u32 op = inst >> 26, ra = (inst >> 16) & 31;
+    u32 ea = op == 31 ? (ra ? cpu.gpr[ra] : 0) + cpu.gpr[(inst >> 11) & 31]
+                      : (ra ? cpu.gpr[ra] : 0) + (u32)(s32)(s16)inst;
+    if (op == 56 || op == 57 || op == 60 || op == 61) ea = (ra ? cpu.gpr[ra] : 0) + (u32)((s32)(inst << 20) >> 20);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "+slow@%03x dr%d bat%d al%d", ea >> 20, (cpu.msr & MSR_DR) != 0,
+             Mem::DataBatTable()[ea >> 17] != 0, (int)(ea & 7));
+    name += buf;
+  }
+  (*s_prof)[name]++;
+  fn(inst);
+}
+bool ProfilingEnabled() {
+  static int on = -1;
+  if (on < 0) {
+    on = getenv("EMUGC_JIT_PROF") != nullptr;
+    if (on) {
+      s_prof = new std::map<std::string, u64>;
+      atexit(PrintProfile);
+    }
+  }
+  return on;
 }
 
 bool Compile(u32 id, u32 block_pa, const u32* insts, const Interpreter::OpFn* fns, u32 count) {
@@ -1446,7 +1492,13 @@ bool Compile(u32 id, u32 block_pa, const u32* insts, const Interpreter::OpFn* fn
     CacheWriteBack(e);  // the handler works on the CPU state in memory
     call(s_flush);
     e.LoadImm(3, insts[k]);
-    e.CallAbs(Addr((const void*)fns[k]));
+    if (ProfilingEnabled()) {
+      e.LoadImm(4, Addr((const void*)fns[k]));
+      e.LoadImm(5, has_fast_path);
+      e.CallAbs(Addr((const void*)ProfiledCall));
+    } else {
+      e.CallAbs(Addr((const void*)fns[k]));
+    }
     call(s_post);
     jump_unless(PPCEmitter::BO_FALSE, PPCEmitter::CR0_GT, s_exit);  // gt: leave
     if (last) {

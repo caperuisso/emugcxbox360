@@ -25,12 +25,19 @@ the PC (reference images, qemu-ppc big-endian runs) before going to the console.
 - [x] v9: generated dispatcher chaining blocks
 - [x] v10-v14: GPR, CR and FPR caching in host registers, block linking, more instructions inline
       (98%+ of executed instructions native)
-- Each version verified bit-identical to the interpreter over 300 WW fields under qemu-ppc.
+- [x] v16: fixed the BAT index in the memory fast path and the dispatcher (rotate by 17, not 15):
+      every load/store and every unlinked block exit used to fall back to C. Interpreted
+      instructions over 30 WW fields: 32M -> 2.0M (left: idle loops, mtmsr, mftb, MMIO)
+- [x] `EMUGC_JIT_PROF=1`: counts the instructions still interpreted (with the address region of
+      memory slow paths), printed at exit
+- Each version verified bit-identical to the interpreter over 300-1500 WW fields under qemu-ppc.
 - [ ] Quantized psq types (u8/s16 with scale), remaining interpreted instructions
 
 ## Other
 - [ ] Save states are host-endian (a PC state does not load on the 360 / PPC build)
 - [x] VI line event only on interesting lines; 200k-cycle slices (identical output)
 - [x] On-screen profiler (C/G/A/V shares) for hardware measurements
+- [x] GPU texture cache capped by memory (EFB copies made a new 1.3 MB texture per frame)
+- [x] Rectangle read-backs flush only the tile rows they read (peeks)
 - [ ] Audio/DSP and frame pacing costs on the console
 - [ ] Measure on hardware: FPS with JIT on/off (Start), GPU rendering on/off (B)
