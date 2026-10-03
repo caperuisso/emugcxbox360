@@ -75,7 +75,10 @@ constexpr u32 R_PENDING = 27;
 constexpr u32 R_MEM1 = 26;   // Mem::g_mem1
 constexpr u32 R_DBAT = 25;   // data BAT table
 constexpr u32 R_STAMP = 24;  // Mem::g_page_stamp
-constexpr int FRAME = 48;    // r24-r31 saved at 16..44
+constexpr u32 R_MAP = 23;    // block cache map (physical word -> block id)
+constexpr u32 R_ENTRY = 22;  // block id -> generated code
+constexpr u32 R_IBAT = 21;   // instruction BAT table
+constexpr int FRAME = 64;    // r20-r31 saved at 12..56
 
 constexpr s32 OFF_GPR = (s32)offsetof(CPUState, gpr);
 constexpr s32 OFF_PC = (s32)offsetof(CPUState, pc);
@@ -93,7 +96,11 @@ static_assert(OFF_SPR + 1024 * 4 < 32768, "CPU state offsets must fit a 16-bit d
 inline s32 Gpr(u32 n) { return OFF_GPR + (s32)n * 4; }
 
 // Offsets (instructions) of the shared routines in the code buffer
-size_t s_post = 0, s_flush = 0, s_budget = 0;
+size_t s_post = 0, s_flush = 0, s_budget = 0, s_dispatch = 0, s_exit = 0, s_enter = 0;
+
+constexpr u32 MAX_IDS = 1u << 20;
+u32* s_entries = nullptr;    // block id -> code address (0: not compiled)
+const u32* s_map = nullptr;  // block cache map
 
 // r30 = ceil((slice_end - cycles) / cpi), saturated to 2^31 - 1. Uses r6-r11.
 // The code ends with both paths branching to the returned join points.
@@ -151,8 +158,10 @@ void EmitFlush(PPCEmitter& e) {
 }
 
 // After an interpreted instruction (cpu.pc = its address = r28, cpu.npc = next):
-// the cached interpreter's bookkeeping. On return cr0.eq = continue (r28 = new
-// pc, budget recomputed), cr0.ne = leave the block.
+// the cached interpreter's bookkeeping. On return:
+//   cr0.eq: continue with the next instruction (r28 = pc, budget recomputed)
+//   cr0.lt: branch taken, go to the dispatcher (r28 = target, budget valid)
+//   cr0.gt: leave the generated code (state published, r28 = cpu.pc)
 void EmitPost(PPCEmitter& e) {
   const u32 cpi = CPU::g_cycles_per_instruction;
   std::vector<u32> leave;
@@ -181,11 +190,6 @@ void EmitPost(PPCEmitter& e) {
   u32 not_idle = e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ);
   e.CallAbs(Addr((const void*)&HelperIdle));
   e.PatchBranchTo(not_idle, e.Here());
-  // taken branch: leave
-  e.lwz(4, OFF_NPC, R_CPU);
-  e.addi(5, R_PC, 4);
-  e.cmplw(0, 4, 5);
-  leave.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_EQ));
   // end of the time slice: leave
   e.LoadImm(6, Addr(&CoreTiming::g_slice_end));
   e.lwz(7, 0, 6);
@@ -198,28 +202,75 @@ void EmitPost(PPCEmitter& e) {
   e.cmplw(0, 10, 8);
   leave.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_LT));
   e.PatchBranchTo(hi_less, e.Here());
-  // continue: r28 = pc (npc, still in r4), new budget
+  // continue: r28 = new pc, budget; cr0 = taken branch ? lt : eq
+  e.lwz(4, OFF_PC, R_CPU);
+  e.addi(5, R_PC, 4);
   e.mr(R_PC, 4);
+  e.cmplw(0, 4, 5);
+  u32 not_taken = e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ);
   std::vector<u32> joins;
   EmitBudgetBody(e, joins);
-  u32 join = e.Here();
-  for (u32 j : joins) e.PatchBranchTo(j, join);
+  u32 j1 = e.Here();
+  for (u32 j : joins) e.PatchBranchTo(j, j1);
+  e.li(0, -1);
+  e.cmpwi(0, 0, 0);  // lt
+  e.mtlr(R_LINK);
+  e.blr();
+  e.PatchBranchTo(not_taken, e.Here());
+  joins.clear();
+  EmitBudgetBody(e, joins);
+  u32 j2 = e.Here();
+  for (u32 j : joins) e.PatchBranchTo(j, j2);
   e.cmpw(0, 0, 0);  // eq
   e.mtlr(R_LINK);
   e.blr();
-  // leave: cr0 = ne
+  // leave: r28 = cpu.pc, cr0 = gt
   u32 at = e.Here();
   for (u32 l : leave) e.PatchBranchTo(l, at);
+  e.lwz(R_PC, OFF_PC, R_CPU);
   e.li(0, 1);
-  e.cmpwi(0, 0, 0);  // ne
+  e.cmpwi(0, 0, 0);  // gt
   e.mtlr(R_LINK);
   e.blr();
+}
+
+// Finds the block at r28 and jumps to its code; anything unusual (end of the
+// time slice, translation off or missing, block not compiled) goes to exit.
+void EmitDispatch(PPCEmitter& e, std::vector<u32>& to_exit) {
+  e.cmpwi(0, R_BUDGET, 0);
+  to_exit.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_GT));
+  e.lwz(0, OFF_MSR, R_CPU);
+  e.andi_(0, 0, MSR_IR);
+  to_exit.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+  e.rlwinm(4, R_PC, 15, 15, 29);  // (pc >> 17) * 4
+  e.lwzx(5, R_IBAT, 4);
+  e.cmpwi(0, 5, 0);
+  to_exit.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+  e.rlwimi(5, R_PC, 0, 15, 31);  // pa
+  e.rlwinm(7, 5, 9, 23, 31);
+  e.cmplwi(0, 7, 3);
+  to_exit.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_LT));
+  e.andi_(0, 5, 3);
+  to_exit.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_EQ));
+  e.lwzx(6, R_MAP, 5);  // map[pa >> 2]: byte offset pa
+  e.LoadImm(7, MAX_IDS);
+  e.cmplw(0, 6, 7);
+  to_exit.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_LT));
+  e.cmpwi(0, 6, 0);
+  to_exit.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+  e.rlwinm(6, 6, 2, 0, 29);
+  e.lwzx(7, R_ENTRY, 6);
+  e.cmpwi(0, 7, 0);
+  to_exit.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+  e.mtctr(7);
+  e.bctr();
 }
 
 bool AllocCode() {
   if (s_code) return true;
   s_code = (u32*)malloc(CODE_SIZE);
-  return s_code != nullptr;
+  s_entries = (u32*)calloc(MAX_IDS, sizeof(u32));
+  return s_code != nullptr && s_entries != nullptr;
 }
 
 void Reset() {
@@ -230,9 +281,50 @@ void Reset() {
   EmitFlush(e);
   s_post = e.Here();
   EmitPost(e);
+  // dispatcher, then the exit (publish the state, epilogue)
+  std::vector<u32> to_exit;
+  s_dispatch = e.Here();
+  EmitDispatch(e, to_exit);
+  s_exit = e.Here();
+  for (u32 at : to_exit) e.PatchBranchTo(at, s_exit);
+  {
+    s32 off = ((s32)s_flush - (s32)e.Here()) * 4;
+    e.Emit(0x48000001 | ((u32)off & 0x03FFFFFC));  // bl flush
+  }
+  e.lwz(0, FRAME + 4, 1);
+  e.mtlr(0);
+  for (u32 r = 20; r <= 31; r++) e.lwz(r, 12 + (s32)(r - 20) * 4, 1);
+  e.addi(1, 1, FRAME);
+  e.blr();
+  // enter(): C entry point. Saves registers, loads the constants, then dispatches.
+  s_enter = e.Here();
+  e.stwu(1, -FRAME, 1);
+  e.mflr(0);
+  e.stw(0, FRAME + 4, 1);
+  for (u32 r = 20; r <= 31; r++) e.stw(r, 12 + (s32)(r - 20) * 4, 1);
+  e.LoadImm(R_CPU, Addr(&cpu));
+  e.LoadImm(R_MEM1, Addr(Mem::g_mem1));
+  e.LoadImm(R_DBAT, Addr(Mem::DataBatTable()));
+  e.LoadImm(R_STAMP, Addr(Mem::g_page_stamp));
+  e.LoadImm(R_MAP, Addr(s_map));
+  e.LoadImm(R_ENTRY, Addr(s_entries));
+  e.LoadImm(R_IBAT, Addr(Mem::InstrBatTable()));
+  e.lwz(R_PC, OFF_PC, R_CPU);
+  e.li(R_PENDING, 0);
+  e.mr(20, 3);  // keep the entry across the budget call (r20 is unused otherwise... saved below)
+  {
+    s32 off = ((s32)s_budget - (s32)e.Here()) * 4;
+    e.Emit(0x48000001 | ((u32)off & 0x03FFFFFC));  // bl budget
+  }
+  e.mr(3, 20);
+  // jump to the first block (r3, found by the C loop): it always runs, even
+  // where the dispatcher could not translate the pc (real mode)
+  e.mtctr(3);
+  e.bctr();
   memcpy(s_code, e.code.data(), e.code.size() * 4);
   FlushCode(s_code, e.code.size());
   s_used = e.code.size();
+  memset(s_entries, 0, MAX_IDS * sizeof(u32));
 }
 
 // ---- Inlined instructions ----
@@ -977,55 +1069,73 @@ void EmitMemFast(PPCEmitter& e, u32 inst, const MemOp& m, std::vector<u32>& slow
 bool Enabled() { return s_enabled; }
 void SetEnabled(bool on) { s_enabled = on && kHostPPC; }
 void SetInlining(bool on) { s_inline_enabled = on; }
+void SetBlockMap(const u32* map) {
+  if (map != s_map) {
+    s_map = map;
+    if (s_code) Reset();
+  }
+}
 
 void Clear() {
   if (s_code) Reset();
 }
 size_t CodeBytes() { return s_used * 4; }
 
-BlockFn Compile(const u32* insts, const Interpreter::OpFn* fns, u32 count) {
-  if (!s_enabled) return nullptr;
+bool HasBlock(u32 id) { return s_entries && id < MAX_IDS && s_entries[id]; }
+
+void Run(u32 id) {
+  using EnterFn = void (*)(u32 entry);
+  ((EnterFn)(void*)(s_code + s_enter))(s_entries[id]);
+}
+
+bool Compile(u32 id, const u32* insts, const Interpreter::OpFn* fns, u32 count) {
+  if (!s_enabled || !s_map || id >= MAX_IDS) return true;  // stays interpreted
   if (!s_code) {
     if (!AllocCode()) {
       s_enabled = false;
-      return nullptr;
+      return true;
     }
     Reset();
   }
   PPCEmitter e;
   e.code.reserve(32 + count * 16);
-  std::vector<u32> leave;    // to the epilogue (state already published)
-  std::vector<u32> exhaust;  // budget exhausted after an inlined instruction
-  struct Call {
+  struct Jump {
     u32 at;
     size_t target;
+    bool link;
   };
-  std::vector<Call> calls;  // `bl` to shared routines, patched once placed
-  auto bl = [&](size_t target) {
-    calls.push_back({e.Here(), target});
-    e.Emit(0x48000001);
+  std::vector<Jump> jumps;  // to shared routines, patched once placed
+  auto call = [&](size_t target) {
+    jumps.push_back({e.Here(), target, true});
+    e.Emit(0);
   };
+  auto jump = [&](size_t target) {
+    jumps.push_back({e.Here(), target, false});
+    e.Emit(0);
+  };
+  // conditional jump to a far routine: skip over an unconditional branch
+  auto jump_unless = [&](u32 bo, u32 bi, size_t target) {
+    u32 skip = e.bc_forward(bo, bi);
+    jump(target);
+    e.PatchBranchTo(skip, e.Here());
+  };
+  std::vector<u32> exhaust;  // budget exhausted after an inlined instruction -> exit
 
-  // Prologue: save LR and r27-r31; r28 = pc, nothing pending, budget
-  e.stwu(1, -FRAME, 1);
-  e.mflr(0);
-  e.stw(0, FRAME + 4, 1);
-  for (u32 r = 24; r <= 31; r++) e.stw(r, 16 + (s32)(r - 24) * 4, 1);
-  e.LoadImm(R_CPU, Addr(&cpu));
-  e.LoadImm(R_MEM1, Addr(Mem::g_mem1));
-  e.LoadImm(R_DBAT, Addr(Mem::DataBatTable()));
-  e.LoadImm(R_STAMP, Addr(Mem::g_page_stamp));
-  e.lwz(R_PC, OFF_PC, R_CPU);
-  e.li(R_PENDING, 0);
-  bl(s_budget);
-
-  bool last_inline = false;
-  for (u32 k = 0; k < count; k++) {
+  bool ended = false;
+  for (u32 k = 0; k < count && !ended; k++) {
+    bool last = k + 1 == count;
     MemOp m;
     u32 ra = Field(insts[k], 16), rd = Field(insts[k], 21);
     std::vector<u32> slow;
     bool fast = false;
     if (s_inline_enabled) {
+      if (last && EmitBranch(e, insts[k])) {
+        e.addi(R_PENDING, R_PENDING, 1);
+        e.Emit(PPCEmitter::D(13, R_BUDGET, R_BUDGET, -1));  // addic. r30, r30, -1
+        jump(s_dispatch);
+        ended = true;
+        continue;
+      }
       if (DecodeMemOp(insts[k], m) && !(m.update && (ra == 0 || (!m.store && !m.fp && ra == rd)))) {
         EmitMemFast(e, insts[k], m, slow);
         fast = true;
@@ -1033,81 +1143,57 @@ BlockFn Compile(const u32* insts, const Interpreter::OpFn* fns, u32 count) {
         fast = true;
       } else if (EmitPsqFast(e, insts[k], slow)) {
         fast = true;
+      } else if (EmitInline(e, insts[k])) {
+        fast = true;
       }
     }
+    u32 to_next = 0;
+    bool has_fast_path = fast;
     if (fast) {
-      // fast path done: inline bookkeeping
       e.addi(R_PC, R_PC, 4);
       e.addi(R_PENDING, R_PENDING, 1);
       e.Emit(PPCEmitter::D(13, R_BUDGET, R_BUDGET, -1));  // addic. r30, r30, -1
-      if (k + 1 < count) exhaust.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
-      u32 to_next = e.b_forward();
-      // slow path: the interpreter
-      u32 slow_at = e.Here();
-      for (u32 at : slow) e.PatchBranchTo(at, slow_at);
-      bl(s_flush);
-      e.LoadImm(3, insts[k]);
-      e.CallAbs(Addr((const void*)fns[k]));
-      bl(s_post);
-      if (k + 1 < count) {
-        leave.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_EQ));
-        e.PatchBranchTo(to_next, e.Here());
-      } else {
-        // last instruction: the slow path leaves with the state published,
-        // the fast path joins the flushing exit
-        leave.push_back(e.b_forward());
-        e.PatchBranchTo(to_next, e.Here());
-      }
-      last_inline = true;  // the fast path needs the final flush
-      continue;
+      exhaust.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+      if (slow.empty()) continue;  // no fallback needed
+      to_next = e.b_forward();
     }
-    if (s_inline_enabled && k + 1 == count && EmitBranch(e, insts[k])) {
-      e.addi(R_PENDING, R_PENDING, 1);
-      last_inline = true;  // flush (pc = r28) and leave
-      break;
-    }
-    if (s_inline_enabled && EmitInline(e, insts[k])) {
-      e.addi(R_PC, R_PC, 4);
-      e.addi(R_PENDING, R_PENDING, 1);
-      e.Emit(PPCEmitter::D(13, R_BUDGET, R_BUDGET, -1));  // addic. r30, r30, -1
-      if (k + 1 < count) exhaust.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
-      last_inline = true;
-      continue;
-    }
-    // Interpreted: publish pc/npc/cycles, call the handler, bookkeeping
-    bl(s_flush);
+    // Interpreted (or the slow path of a fast instruction)
+    u32 slow_at = e.Here();
+    for (u32 at : slow) e.PatchBranchTo(at, slow_at);
+    call(s_flush);
     e.LoadImm(3, insts[k]);
     e.CallAbs(Addr((const void*)fns[k]));
-    bl(s_post);
-    if (k + 1 < count) leave.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_EQ));
-    last_inline = false;
+    call(s_post);
+    jump_unless(PPCEmitter::BO_FALSE, PPCEmitter::CR0_GT, s_exit);  // gt: leave
+    if (last) {
+      jump(s_dispatch);  // eq or lt: the dispatcher continues at r28
+      ended = true;
+    } else {
+      jump_unless(PPCEmitter::BO_FALSE, PPCEmitter::CR0_LT, s_dispatch);  // lt: branch taken
+    }
+    if (has_fast_path) {
+      e.PatchBranchTo(to_next, e.Here());
+      if (last) jump(s_dispatch);  // the fast path of the last instruction
+    }
   }
-  // After an inlined last instruction, or when the budget ran out: publish
-  // the state (pc = r28, cycles).
-  if (!last_inline) leave.push_back(e.b_forward());
-  u32 flush_exit = e.Here();
-  for (u32 at : exhaust) e.PatchBranchTo(at, flush_exit);
-  bl(s_flush);
+  if (!ended) jump(s_dispatch);  // end of the block after an inlined instruction
+  if (!exhaust.empty()) {
+    u32 at = e.Here();
+    for (u32 x : exhaust) e.PatchBranchTo(x, at);
+    jump(s_exit);
+  }
 
-  // Epilogue
-  u32 epilogue = e.Here();
-  for (u32 at : leave) e.PatchBranchTo(at, epilogue);
-  e.lwz(0, FRAME + 4, 1);
-  e.mtlr(0);
-  for (u32 r = 24; r <= 31; r++) e.lwz(r, 16 + (s32)(r - 24) * 4, 1);
-  e.addi(1, 1, FRAME);
-  e.blr();
-
-  if (s_used + e.code.size() > CODE_SIZE / 4) return nullptr;
+  if (s_used + e.code.size() > CODE_SIZE / 4) return false;
   u32* dst = s_code + s_used;
-  for (const Call& c : calls) {
-    s32 off = ((s32)c.target - (s32)(s_used + c.at)) * 4;
-    e.code[c.at] = 0x48000001 | ((u32)off & 0x03FFFFFC);
+  for (const Jump& j : jumps) {
+    s32 off = ((s32)j.target - (s32)(s_used + j.at)) * 4;
+    e.code[j.at] = 0x48000000 | ((u32)off & 0x03FFFFFC) | (j.link ? 1u : 0u);
   }
   memcpy(dst, e.code.data(), e.code.size() * 4);
   FlushCode(dst, e.code.size());
   s_used += e.code.size();
-  return (BlockFn)(void*)dst;
+  s_entries[id] = Addr(dst);
+  return true;
 }
 
 }  // namespace Jit

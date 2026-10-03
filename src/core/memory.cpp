@@ -190,6 +190,7 @@ void Write32(u32 ea, u32 v) { WriteEA<u32>(ea, v); }
 void Write64(u32 ea, u64 v) { WriteEA<u64>(ea, v); }
 
 const u32* DataBatTable() { return s_dbat; }
+const u32* InstrBatTable() { return s_ibat; }
 
 bool TranslateData(u32 ea, u32& pa) { return Translate(s_dbat, cpu.msr & MSR_DR, ea, pa); }
 bool TranslateInstr(u32 ea, u32& pa) { return Translate(s_ibat, cpu.msr & MSR_IR, ea, pa); }

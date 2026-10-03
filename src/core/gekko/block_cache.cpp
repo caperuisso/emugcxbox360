@@ -27,7 +27,6 @@ struct Decoded {
 struct Block {
   u32 first;  // index into s_code
   u32 count;
-  Jit::BlockFn jit;  // compiled code, or nullptr (interpreted)
 };
 
 constexpr u32 PAGE_SHIFT = 12;
@@ -70,7 +69,6 @@ Block* Compile(u32 pa) {
   Block b;
   b.first = (u32)s_code.size();
   b.count = 0;
-  b.jit = nullptr;
   u32 addr = pa;
   const u8* mem = Mem::g_mem1;
   do {
@@ -80,6 +78,8 @@ Block* Compile(u32 pa) {
     addr += 4;
     if (EndsBlock(inst)) break;
   } while (b.count < MAX_BLOCK && (addr & ((1u << PAGE_SHIFT) - 1)) != 0 && addr < Mem::MEM1_SIZE);
+  s_blocks.push_back(b);
+  s_map[pa >> 2] = (u32)s_blocks.size();
   if (Jit::Enabled()) {
     u32 insts[MAX_BLOCK];
     Interpreter::OpFn fns[MAX_BLOCK];
@@ -87,11 +87,8 @@ Block* Compile(u32 pa) {
       insts[k] = s_code[b.first + k].inst;
       fns[k] = s_code[b.first + k].fn;
     }
-    b.jit = Jit::Compile(insts, fns, b.count);
-    if (!b.jit) s_jit_full = true;
+    if (!Jit::Compile((u32)s_blocks.size(), insts, fns, b.count)) s_jit_full = true;
   }
-  s_blocks.push_back(b);
-  s_map[pa >> 2] = (u32)s_blocks.size();
   s_page_used[pa >> PAGE_SHIFT] = 1;
   return &s_blocks.back();
 }
@@ -101,6 +98,7 @@ Block* Compile(u32 pa) {
 void Init() {
   if (!s_map) s_map = (u32*)calloc(Mem::MEM1_SIZE / 4, sizeof(u32));
   if (!s_page_used) s_page_used = (u8*)calloc(NUM_PAGES, 1);
+  Jit::SetBlockMap(s_map);
   Clear();
 }
 
@@ -138,8 +136,9 @@ void Run() {
     if (UNLIKELY(s_jit_full)) Clear();
     u32 id = s_map[pa >> 2];
     const Block* b = id ? &s_blocks[id - 1] : Compile(pa);
-    if (b->jit) {
-      b->jit();
+    if (!id) id = (u32)s_blocks.size();
+    if (Jit::HasBlock(id)) {
+      Jit::Run(id);
       continue;
     }
     const Decoded* code = &s_code[b->first];
