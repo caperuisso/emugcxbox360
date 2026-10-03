@@ -13,6 +13,7 @@
 #include <xenos/xenos.h>
 extern "C" {
 #include <xenos/xe_internal.h>
+#include <ppc/cache.h>
 }
 
 #include <memory>
@@ -299,9 +300,20 @@ class XenosBackend : public Video::GpuBackend {
     if (color) Xe_ResolveInto(s_xe, m_efb_copy, XE_SOURCE_COLOR, 0);
     if (depth) Xe_ResolveInto(s_xe, m_depth_copy, XE_SOURCE_DS, 0);
     Sync();
-    const u32* src = color ? (const u32*)Xe_Surface_LockRect(s_xe, m_efb_copy, 0, 0, 0, 0, XE_LOCK_READ) : nullptr;
-    const u32* zsrc = depth ? (const u32*)Xe_Surface_LockRect(s_xe, m_depth_copy, 0, 0, 0, 0, XE_LOCK_READ) : nullptr;
+    // Only the rows of 32-line tiles covering the rectangle are flushed from
+    // the data cache (a lock flushes the whole 1.3 MB surface, even for a peek).
     int pitch = ((EFB_W + 31) >> 5) << 5;
+    u32 first = (u32)(y0 >> 5) * 32 * pitch * 4, last = (u32)(((y1 - 1) >> 5) + 1) * 32 * pitch * 4;
+    const u32* src = nullptr;
+    const u32* zsrc = nullptr;
+    if (color) {
+      src = (const u32*)m_efb_copy->base;
+      memdcbf((u8*)m_efb_copy->base + first, (int)(last - first));
+    }
+    if (depth) {
+      zsrc = (const u32*)m_depth_copy->base;
+      memdcbf((u8*)m_depth_copy->base + first, (int)(last - first));
+    }
     for (int y = y0; y < y1; y++)
       for (int x = x0; x < x1; x++) {
         int idx = (((y >> 5) * 32 * pitch + ((x >> 5) << 10) + (x & 3) + ((y & 1) << 2) + (((x & 31) >> 2) << 3) +
@@ -313,11 +325,7 @@ class XenosBackend : public Video::GpuBackend {
         }
         if (zsrc) zbuf[y * EFB_W + x] = zsrc[idx] >> 8;
       }
-    if (zsrc) Xe_Surface_Unlock(s_xe, m_depth_copy);
-    if (src) {
-      Xe_Surface_Unlock(s_xe, m_efb_copy);
-      m_efb_copy_valid = true;
-    }
+    if (src) m_efb_copy_valid = true;
   }
 
   void ReadEFB(u32* color, u32* depth) override {
