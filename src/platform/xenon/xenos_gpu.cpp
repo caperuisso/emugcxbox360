@@ -221,9 +221,12 @@ class XenosBackend : public Video::GpuBackend {
     m_depth_copy = Xe_CreateTexture(s_xe, EFB_W, EFB_H, 1, XE_FMT_8888 | XE_FMT_ARGB, 1);
     m_vb = Xe_CreateVertexBuffer(s_xe, VB_RING_BYTES);
     m_restore_vb = Xe_CreateVertexBuffer(s_xe, 6 * 6 * sizeof(float));
+    // Full-EFB quad shifted by half a pixel so that each pixel samples its own
+    // texel centre (Direct3D 9 pixel convention)
+    const float hx = 1.0f / EFB_W, hy = 1.0f / EFB_H;
     const float quad[6][6] = {
-        {-1, 1, 0, 1, 0, 0}, {1, 1, 0, 1, 1, 0}, {-1, -1, 0, 1, 0, 1},
-        {1, 1, 0, 1, 1, 0}, {1, -1, 0, 1, 1, 1}, {-1, -1, 0, 1, 0, 1},
+        {-1 - hx, 1 + hy, 0, 1, 0, 0}, {1 - hx, 1 + hy, 0, 1, 1, 0}, {-1 - hx, -1 + hy, 0, 1, 0, 1},
+        {1 - hx, 1 + hy, 0, 1, 1, 0},  {1 - hx, -1 + hy, 0, 1, 1, 1}, {-1 - hx, -1 + hy, 0, 1, 0, 1},
     };
     void* v = Xe_VB_Lock(s_xe, m_restore_vb, 0, sizeof(quad), XE_LOCK_WRITE);
     memcpy(v, quad, sizeof(quad));
