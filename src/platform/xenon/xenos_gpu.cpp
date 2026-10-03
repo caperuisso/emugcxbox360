@@ -163,6 +163,7 @@ class XenosBackend : public Video::GpuBackend {
     m_efb_copy->use_filtering = 0;
     m_efb_copy->u_addressing = XE_TEXADDR_CLAMP;
     m_efb_copy->v_addressing = XE_TEXADDR_CLAMP;
+    m_depth_copy = Xe_CreateTexture(s_xe, EFB_W, EFB_H, 1, XE_FMT_8888 | XE_FMT_ARGB, 1);
     m_vb = Xe_CreateVertexBuffer(s_xe, VB_RING_BYTES);
     m_restore_vb = Xe_CreateVertexBuffer(s_xe, 6 * 6 * sizeof(float));
     const float quad[6][6] = {
@@ -194,8 +195,10 @@ class XenosBackend : public Video::GpuBackend {
   void ReadEFB(u32* color, u32* depth) override {
     ActivateEFB();
     Xe_ResolveInto(s_xe, m_efb_copy, XE_SOURCE_COLOR, 0);
+    Xe_ResolveInto(s_xe, m_depth_copy, XE_SOURCE_DS, 0);
     Sync();
     const u32* src = (const u32*)Xe_Surface_LockRect(s_xe, m_efb_copy, 0, 0, 0, 0, XE_LOCK_READ);
+    const u32* zsrc = (const u32*)Xe_Surface_LockRect(s_xe, m_depth_copy, 0, 0, 0, 0, XE_LOCK_READ);
     int pitch = ((EFB_W + 31) >> 5) << 5;
     for (int y = 0; y < EFB_H; y++)
       for (int x = 0; x < EFB_W; x++) {
@@ -205,9 +208,10 @@ class XenosBackend : public Video::GpuBackend {
                    ((y & 8) << 2));
         u32 argb = src[idx];
         color[y * EFB_W + x] = (argb << 8) | (argb >> 24);  // -> 0xRRGGBBAA
+        depth[y * EFB_W + x] = zsrc[idx] >> 8;               // D24S8: depth in the top 24 bits
       }
+    Xe_Surface_Unlock(s_xe, m_depth_copy);
     Xe_Surface_Unlock(s_xe, m_efb_copy);
-    (void)depth;  // TODO: depth read-back (EFB depth copies, z peeks)
     m_efb_copy_valid = true;
   }
 
@@ -323,6 +327,7 @@ class XenosBackend : public Video::GpuBackend {
   XenosGx::PreparedDraw m_pd;
   XenosSurface* m_efb_rt = nullptr;
   XenosSurface* m_efb_copy = nullptr;
+  XenosSurface* m_depth_copy = nullptr;
   bool m_efb_copy_valid = false;
   XenosVertexBuffer* m_vb = nullptr;
   XenosVertexBuffer* m_restore_vb = nullptr;
