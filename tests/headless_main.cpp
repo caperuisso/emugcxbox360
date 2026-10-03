@@ -61,7 +61,8 @@ class HeadlessHost : public Host {
     }
     (void)rate;
   }
-  std::string MemcardPath(int slot) override { (void)slot; return std::string(); }
+  std::string memcard;  // EMUGC_MEMCARD
+  std::string MemcardPath(int slot) override { return slot == 0 ? memcard : std::string(); }
 
   const u32* last = nullptr;
   int lw = 0, lh = 0;
@@ -84,9 +85,16 @@ int main(int argc, char** argv) {
   if (jit && !strcmp(jit, "0")) Jit::SetEnabled(false);
   if (jit && !strcmp(jit, "noinline")) Jit::SetInlining(false);
   int fields = atoi(argv[2]);
+  if (const char* mc = getenv("EMUGC_MEMCARD")) host.memcard = mc;
   if (!System::Init(&host) || !System::Boot(argv[1])) {
     printf("boot failed\n");
     return 1;
+  }
+  if (const char* st = getenv("EMUGC_STATE")) {
+    if (!System::LoadState(st)) {
+      printf("state load failed\n");
+      return 1;
+    }
   }
   for (host.frame = 0; host.frame < fields; host.frame++) {
     if (argc > 3 && host.frame == fields - 1) host.dump_path = argv[3];
