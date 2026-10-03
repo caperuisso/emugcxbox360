@@ -81,7 +81,8 @@ constexpr u32 R_STAMP = 24;  // Mem::g_page_stamp
 constexpr u32 R_MAP = 23;    // block cache map (physical word -> block id)
 constexpr u32 R_ENTRY = 22;  // block id -> generated code
 constexpr u32 R_IBAT = 21;   // instruction BAT table
-constexpr int FRAME = 96;    // r14-r31 saved at 16..84
+constexpr int FRAME = 240;   // r14-r31 saved at 16..84, f14-f31 at 96..232
+constexpr int FPR_SAVE = 96;
 // Guest GPRs cached in host registers within a block
 constexpr u32 CACHE_FIRST = 14, CACHE_COUNT = 6;  // r14-r19
 constexpr u32 R_CRC = 20;  // guest CR, cached for the whole block
@@ -311,6 +312,7 @@ void Reset() {
   e.lwz(0, FRAME + 4, 1);
   e.mtlr(0);
   for (u32 r = 14; r <= 31; r++) e.lwz(r, 16 + (s32)(r - 14) * 4, 1);
+  for (u32 f = 14; f <= 31; f++) e.lfd(f, FPR_SAVE + (s32)(f - 14) * 8, 1);
   e.addi(1, 1, FRAME);
   e.blr();
   // enter(): C entry point. Saves registers, loads the constants, then dispatches.
@@ -319,6 +321,7 @@ void Reset() {
   e.mflr(0);
   e.stw(0, FRAME + 4, 1);
   for (u32 r = 14; r <= 31; r++) e.stw(r, 16 + (s32)(r - 14) * 4, 1);
+  for (u32 f = 14; f <= 31; f++) e.stfd(f, FPR_SAVE + (s32)(f - 14) * 8, 1);
   e.LoadImm(R_CPU, Addr(&cpu));
   e.LoadImm(R_MEM1, Addr(Mem::g_mem1));
   e.LoadImm(R_DBAT, Addr(Mem::DataBatTable()));
@@ -384,15 +387,45 @@ inline void StoreGpr(PPCEmitter& e, u32 h, u32 g) {
     e.stw(h, Gpr(g), R_CPU);
   }
 }
+// Guest FPR halves cached in host f14-f31 (ps0, ps1 pairs)
+u32 s_fcache[32];  // host FPR of ps0 (ps1 = +1), 0 = in memory
+u64 s_fcache_written;  // bit 2*g + half
+constexpr u32 FCACHE_FIRST = 14, FCACHE_PAIRS = 9;
+const double kOneD = 1.0;
+
+inline s32 FprOff(u32 g, int half) { return OFF_FPR + (s32)g * 16 + half * 8; }
+// Host FPR holding guest g's half (loading it into `tmp` when not cached).
+inline u32 FprRead(PPCEmitter& e, u32 tmp, u32 g, int half) {
+  if (s_fcache[g]) return s_fcache[g] + half;
+  e.lfd(tmp, FprOff(g, half), R_CPU);
+  return tmp;
+}
+inline void FprWrite(PPCEmitter& e, u32 src, u32 g, int half) {
+  if (s_fcache[g]) {
+    if (s_fcache[g] + half != src) e.Emit(PPCEmitter::X(63, s_fcache[g] + half, 0, src, 72));  // fmr
+    s_fcache_written |= 1ull << (2 * g + half);
+  } else {
+    e.stfd(src, FprOff(g, half), R_CPU);
+  }
+}
+
 void CacheWriteBack(PPCEmitter& e) {
   for (u32 g = 0; g < 32; g++)
     if (s_cache[g] && (s_cache_written & (1u << g))) e.stw(s_cache[g], Gpr(g), R_CPU);
   if (s_cr_cached && s_cr_written) e.stw(R_CRC, OFF_CR, R_CPU);
+  for (u32 g = 0; g < 32; g++)
+    for (int h = 0; h < 2; h++)
+      if (s_fcache[g] && (s_fcache_written & (1ull << (2 * g + h)))) e.stfd(s_fcache[g] + h, FprOff(g, h), R_CPU);
 }
 void CacheReload(PPCEmitter& e) {
   for (u32 g = 0; g < 32; g++)
     if (s_cache[g]) e.lwz(s_cache[g], Gpr(g), R_CPU);
   if (s_cr_cached) e.lwz(R_CRC, OFF_CR, R_CPU);
+  for (u32 g = 0; g < 32; g++)
+    if (s_fcache[g]) {
+      e.lfd(s_fcache[g], FprOff(g, 0), R_CPU);
+      e.lfd(s_fcache[g] + 1, FprOff(g, 1), R_CPU);
+    }
 }
 
 // Chooses the guest registers to cache: the most used ones (at least twice).
@@ -404,6 +437,32 @@ void PlanCache(const u32* insts, u32 count) {
     uses[(in >> 21) & 31]++;
     uses[(in >> 16) & 31]++;
     if (op == 31 || op == 4) uses[(in >> 11) & 31]++;
+  }
+  // FPR uses: FP loads/stores, psq, FP arithmetic and paired singles
+  u32 fuses[32] = {};
+  for (u32 k = 0; k < count; k++) {
+    u32 in = insts[k], op = in >> 26;
+    if (op >= 48 && op <= 61) {
+      fuses[(in >> 21) & 31]++;
+    } else if (op == 59 || op == 63 || op == 4) {
+      fuses[(in >> 21) & 31]++;
+      fuses[(in >> 16) & 31]++;
+      fuses[(in >> 11) & 31]++;
+      fuses[(in >> 6) & 31]++;
+    } else if (op == 31) {
+      u32 xo = (in >> 1) & 0x3FF;
+      if (xo == 535 || xo == 567 || xo == 599 || xo == 631 || xo == 663 || xo == 695 || xo == 727 || xo == 759)
+        fuses[(in >> 21) & 31]++;
+    }
+  }
+  memset(s_fcache, 0, sizeof(s_fcache));
+  s_fcache_written = 0;
+  for (u32 n = 0; n < FCACHE_PAIRS; n++) {
+    u32 best = 32, best_uses = 1;
+    for (u32 g = 0; g < 32; g++)
+      if (!s_fcache[g] && fuses[g] > best_uses) best = g, best_uses = fuses[g];
+    if (best == 32) break;
+    s_fcache[best] = FCACHE_FIRST + 2 * n;
   }
   memset(s_cache, 0, sizeof(s_cache));
   s_cache_written = 0;
@@ -703,32 +762,36 @@ bool DecodeFpOp(u32 inst, FpOp& f) {
 void EmitFpTerm(PPCEmitter& e, u32 inst, const FpTerm& t, bool round) {
   u32 ra = Field(inst, 16), rb = Field(inst, 11), rc = Field(inst, 6);
   auto fpr = [](u32 r, int half) { return OFF_FPR + (s32)r * 16 + half * 8; };
+  (void)fpr;
   if (t.kind == FK_COPYC) {
-    e.lfd(0, fpr(rc, t.c), R_CPU);
-    if (round) e.Emit(PPCEmitter::X(63, 0, 0, 0, 12));  // frsp
+    u32 c = FprRead(e, 3, rc, t.c);
+    if (round)
+      e.Emit(PPCEmitter::X(63, 0, 0, c, 12));  // frsp f0, c
+    else
+      e.Emit(PPCEmitter::X(63, 0, 0, c, 72));  // fmr
     return;
   }
   bool uses_c = t.kind == FK_MUL || (t.kind >= FK_MADD && t.kind <= FK_NMSUB);
   bool uses_b = t.kind != FK_MUL;
-  e.lfd(1, fpr(ra, t.a), R_CPU);
-  if (uses_b) e.lfd(2, fpr(rb, t.b), R_CPU);
-  if (uses_c) e.lfd(3, fpr(rc, t.c), R_CPU);
+  u32 fa = FprRead(e, 1, ra, t.a);
+  u32 fb = uses_b ? FprRead(e, 2, rb, t.b) : 0;
+  u32 fc = uses_c ? FprRead(e, 3, rc, t.c) : 0;
   auto A = [&](u32 xo, u32 frt, u32 fra, u32 frb, u32 frc) { e.Emit(PPCEmitter::A(63, frt, fra, frb, frc, xo)); };
   switch (t.kind) {
-    case FK_ADD: A(21, 0, 1, 2, 0); break;
-    case FK_SUB: A(20, 0, 1, 2, 0); break;
-    case FK_MUL: A(25, 0, 1, 0, 3); break;
-    case FK_DIV: A(18, 0, 1, 2, 0); break;
+    case FK_ADD: A(21, 0, fa, fb, 0); break;
+    case FK_SUB: A(20, 0, fa, fb, 0); break;
+    case FK_MUL: A(25, 0, fa, 0, fc); break;
+    case FK_DIV: A(18, 0, fa, fb, 0); break;
     default:
       if (kFused) {
         u32 xo = t.kind == FK_MADD ? 29 : t.kind == FK_MSUB ? 28 : t.kind == FK_NMADD ? 31 : 30;
-        A(xo, 0, 1, 2, 3);
+        A(xo, 0, fa, fb, fc);
       } else {
-        A(25, 0, 1, 0, 3);  // f0 = a * c
+        A(25, 0, fa, 0, fc);  // f0 = a * c
         if (t.kind == FK_MADD || t.kind == FK_NMADD)
-          A(21, 0, 0, 2, 0);  // + b
+          A(21, 0, 0, fb, 0);  // + b
         else
-          A(20, 0, 0, 2, 0);  // - b
+          A(20, 0, 0, fb, 0);  // - b
         if (t.kind == FK_NMADD || t.kind == FK_NMSUB) e.Emit(PPCEmitter::X(63, 0, 0, 0, 40));  // fneg
       }
       break;
@@ -804,27 +867,24 @@ bool EmitPsqFast(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
   e.rlwinm(7, 7, 9, 23, 31);  // (pa + 8) >> 23 < 3: both elements in MEM1
   e.cmplwi(0, 7, 3);
   slow.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_LT));
-  s32 fpr = OFF_FPR + (s32)rd * 16;
   if (!store) {
     e.lfsx(0, R_MEM1, 5);
     if (w) {
-      e.LoadImm(6, 0x3FF00000);  // 1.0
-      e.li(7, 0);
-      e.stw(6, fpr + 8, R_CPU);
-      e.stw(7, fpr + 12, R_CPU);
+      e.LoadImm(6, Addr(&kOneD));
+      e.lfd(1, 0, 6);
     } else {
       e.addi(6, 5, 4);
       e.lfsx(1, R_MEM1, 6);
-      e.stfd(1, fpr + 8, R_CPU);
     }
-    e.stfd(0, fpr, R_CPU);
+    FprWrite(e, 0, rd, 0);
+    FprWrite(e, 1, rd, 1);
   } else {
-    e.lfd(0, fpr, R_CPU);
-    e.Emit(PPCEmitter::X(63, 0, 0, 0, 12));  // frsp
+    u32 f0 = FprRead(e, 0, rd, 0);
+    e.Emit(PPCEmitter::X(63, 0, 0, f0, 12));  // frsp f0, ps0
     e.stfsx(0, R_MEM1, 5);
     if (!w) {
-      e.lfd(1, fpr + 8, R_CPU);
-      e.Emit(PPCEmitter::X(63, 1, 0, 1, 12));  // frsp f1, f1
+      u32 f1 = FprRead(e, 1, rd, 1);
+      e.Emit(PPCEmitter::X(63, 1, 0, f1, 12));  // frsp f1, ps1
       e.addi(6, 5, 4);
       e.stfsx(1, R_MEM1, 6);
     }
@@ -866,36 +926,30 @@ bool EmitFpMove(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
   e.andi_(0, 0, MSR_FP);
   slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
   if (kind == -2) {  // frsp: both halves = RoundSingle(B)
-    e.lfd(0, fpr(rb, 0), R_CPU);
-    e.Emit(PPCEmitter::X(63, 0, 0, 0, 12));
-    e.stfd(0, fpr(rd, 0), R_CPU);
-    e.stfd(0, fpr(rd, 1), R_CPU);
+    u32 fb = FprRead(e, 1, rb, 0);
+    e.Emit(PPCEmitter::X(63, 0, 0, fb, 12));
+    FprWrite(e, 0, rd, 0);
+    FprWrite(e, 0, rd, 1);
     return true;
   }
   if (kind == -1) {  // ps_merge: ps0 from A (half a), ps1 from B (half b), read both first
     int ha = (xo == 592 || xo == 624) ? 1 : 0, hb = (xo == 560 || xo == 624) ? 1 : 0;
-    e.lwz(3, fpr(ra, ha), R_CPU);
-    e.lwz(4, fpr(ra, ha) + 4, R_CPU);
-    e.lwz(5, fpr(rb, hb), R_CPU);
-    e.lwz(6, fpr(rb, hb) + 4, R_CPU);
-    e.stw(3, fpr(rd, 0), R_CPU);
-    e.stw(4, fpr(rd, 0) + 4, R_CPU);
-    e.stw(5, fpr(rd, 1), R_CPU);
-    e.stw(6, fpr(rd, 1) + 4, R_CPU);
+    u32 fa = FprRead(e, 1, ra, ha), fb = FprRead(e, 2, rb, hb);
+    e.Emit(PPCEmitter::X(63, 3, 0, fa, 72));  // fmr f3, a
+    e.Emit(PPCEmitter::X(63, 4, 0, fb, 72));  // fmr f4, b
+    FprWrite(e, 3, rd, 0);
+    FprWrite(e, 4, rd, 1);
     return true;
   }
+  // fmr / fneg / fabs / fnabs are exact bit operations on the host too
+  static const u32 kXo[4] = {72, 40, 264, 136};
+  u32 t[2];
   for (int h = 0; h < (pair ? 2 : 1); h++) {
-    e.lwz(3, fpr(rb, h), R_CPU);  // high word holds the sign
-    e.lwz(4, fpr(rb, h) + 4, R_CPU);
-    switch (kind) {
-      case 1: e.xoris(3, 3, 0x8000); break;
-      case 2: e.rlwinm(3, 3, 0, 1, 31); break;
-      case 3: e.oris(3, 3, 0x8000); break;
-      default: break;
-    }
-    e.stw(3, fpr(rd, h), R_CPU);
-    e.stw(4, fpr(rd, h) + 4, R_CPU);
+    u32 fb = FprRead(e, 1 + h, rb, h);
+    t[h] = 3 + h;
+    e.Emit(PPCEmitter::X(63, t[h], 0, fb, kXo[kind]));
   }
+  for (int h = 0; h < (pair ? 2 : 1); h++) FprWrite(e, t[h], rd, h);
   return true;
 }
 
@@ -907,13 +961,13 @@ bool EmitFctiwz(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
   e.lwz(0, OFF_MSR, R_CPU);
   e.andi_(0, 0, MSR_FP);
   slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
-  e.lfd(0, OFF_FPR + (s32)rb * 16, R_CPU);
-  e.Emit(PPCEmitter::X(63, 0, 0, 0, 15));  // fctiwz f0, f0
-  e.stfd(0, 8, 1);                         // scratch slot in our stack frame
-  e.lwz(3, 12, 1);
-  e.LoadImm(4, 0xFFF80000);
-  e.stw(4, OFF_FPR + (s32)rd * 16, R_CPU);
-  e.stw(3, OFF_FPR + (s32)rd * 16 + 4, R_CPU);
+  u32 fb = FprRead(e, 1, rb, 0);
+  e.Emit(PPCEmitter::X(63, 0, 0, fb, 15));  // fctiwz f0, fb
+  e.stfd(0, 8, 1);                          // scratch slot in our stack frame: keep the low word,
+  e.LoadImm(4, 0xFFF80000);                 // replace the high word with the interpreter's constant
+  e.stw(4, 8, 1);
+  e.lfd(0, 8, 1);
+  FprWrite(e, 0, rd, 0);
   return true;
 }
 
@@ -925,9 +979,8 @@ bool EmitFpCompare(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
   e.lwz(0, OFF_MSR, R_CPU);
   e.andi_(0, 0, MSR_FP);
   slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
-  e.lfd(1, OFF_FPR + (s32)ra * 16, R_CPU);
-  e.lfd(2, OFF_FPR + (s32)rb * 16, R_CPU);
-  e.Emit(PPCEmitter::X(63, 0, 1, 2, 0));  // fcmpu cr0, f1, f2
+  u32 fa = FprRead(e, 1, ra, 0), fb = FprRead(e, 2, rb, 0);
+  e.Emit(PPCEmitter::X(63, 0, fa, fb, 0));  // fcmpu cr0, fa, fb
   e.mfcr(0);
   e.rlwinm(7, 0, 4, 28, 31);  // code in the low nibble
   LoadCR(e, 9);
@@ -952,17 +1005,18 @@ bool EmitFpFast(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
   e.lwz(0, OFF_MSR, R_CPU);
   e.andi_(0, 0, MSR_FP);
   slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+  (void)dst;
   if (f.dest == 2) {
     // both halves read the sources before writing (rd may be a source)
     EmitFpTerm(e, inst, f.t0, f.round);
     e.Emit(PPCEmitter::X(63, 4, 0, 0, 72));  // fmr f4, f0
     EmitFpTerm(e, inst, f.t1, f.round);
-    e.stfd(4, dst, R_CPU);
-    e.stfd(0, dst + 8, R_CPU);
+    FprWrite(e, 4, rd, 0);
+    FprWrite(e, 0, rd, 1);
   } else {
     EmitFpTerm(e, inst, f.t0, f.round);
-    e.stfd(0, dst, R_CPU);
-    if (f.dest == 1) e.stfd(0, dst + 8, R_CPU);
+    FprWrite(e, 0, rd, 0);
+    if (f.dest == 1) FprWrite(e, 0, rd, 1);
   }
   return true;
 }
@@ -1182,17 +1236,12 @@ void EmitMemFast(PPCEmitter& e, u32 inst, const MemOp& m, std::vector<u32>& slow
   e.rlwinm(7, 5, 9, 23, 31);  // pa >> 23
   e.cmplwi(0, 7, 3);
   slow.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_LT));
-  const s32 fpr = OFF_FPR + (s32)rd * 16;  // ps0, then ps1 at +8
   if (m.store && m.fp == 2) {
-    e.lwz(6, fpr, R_CPU);
-    e.lwz(7, fpr + 4, R_CPU);
-    e.add(5, 5, R_MEM1);  // host address
-    e.stw(6, 0, 5);
-    e.stw(7, 4, 5);
-    e.Emit(PPCEmitter::XO(5, R_MEM1, 5, 40));  // subf r5, r_mem1, r5: back to pa
+    u32 fs = FprRead(e, 0, rd, 0);
+    e.stfdx(fs, R_MEM1, 5);  // 8-byte aligned (checked above)
   } else if (m.store && m.fp == 1) {
-    e.lfd(0, fpr, R_CPU);
-    e.Emit(PPCEmitter::X(63, 0, 0, 0, 12));  // frsp f0, f0
+    u32 fs = FprRead(e, 0, rd, 0);
+    e.Emit(PPCEmitter::X(63, 0, 0, fs, 12));  // frsp f0, fs
     e.stfsx(0, R_MEM1, 5);
   }
   if (m.store && m.fp) {
@@ -1201,15 +1250,12 @@ void EmitMemFast(PPCEmitter& e, u32 inst, const MemOp& m, std::vector<u32>& slow
     e.rlwinm(9, 5, 22, 10, 29);
     e.stwx(8, R_STAMP, 9);
   } else if (!m.store && m.fp == 2) {
-    e.add(5, 5, R_MEM1);
-    e.lwz(6, 0, 5);
-    e.lwz(7, 4, 5);
-    e.stw(6, fpr, R_CPU);
-    e.stw(7, fpr + 4, R_CPU);
+    e.lfdx(0, R_MEM1, 5);
+    FprWrite(e, 0, rd, 0);
   } else if (!m.store && m.fp == 1) {
     e.lfsx(0, R_MEM1, 5);
-    e.stfd(0, fpr, R_CPU);
-    e.stfd(0, fpr + 8, R_CPU);
+    FprWrite(e, 0, rd, 0);
+    FprWrite(e, 0, rd, 1);
   } else if (m.store) {
     LoadGpr(e, 6, rd);
     u32 xo = m.size == 4 ? 151 : (m.size == 2 ? 407 : 215);  // stwx, sthx, stbx
@@ -1248,6 +1294,7 @@ bool CanInline(u32 inst, bool last) {
   PPCEmitter e;
   std::vector<u32> slow;
   memset(s_cache, 0, sizeof(s_cache));
+  memset(s_fcache, 0, sizeof(s_fcache));
   s_cr_cached = false;
   MemOp m;
   if (last && EmitBranch(e, inst)) return true;
@@ -1338,7 +1385,10 @@ bool Compile(u32 id, u32 block_pa, const u32* insts, const Interpreter::OpFn* fn
   s_static = &sx;
 
   PlanCache(insts, count);
-  if (!s_inline_enabled) memset(s_cache, 0, sizeof(s_cache));
+  if (!s_inline_enabled) {
+    memset(s_cache, 0, sizeof(s_cache));
+    memset(s_fcache, 0, sizeof(s_fcache));
+  }
   s_cr_cached = s_inline_enabled;
   s_cr_written = false;
   CacheReload(e);  // block entry
