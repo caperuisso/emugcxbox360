@@ -17,8 +17,11 @@
 #include "core/jit/jit.h"
 
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <map>
 
 #include "core/coretiming.h"
 #include "core/jit/ppc_emitter.h"
@@ -100,6 +103,17 @@ inline s32 Gpr(u32 n) { return OFF_GPR + (s32)n * 4; }
 
 // Offsets (instructions) of the shared routines in the code buffer
 size_t s_post = 0, s_flush = 0, s_budget = 0, s_dispatch = 0, s_exit = 0, s_enter = 0;
+
+// Block linking: exits with a static target jump straight to the target
+// block's code. Sites are remembered per target physical address so they can
+// be pointed back at the dispatcher when that code changes.
+std::map<u32, std::vector<u32*>> s_incoming;
+
+void PatchBranch(u32* site, u32 target) {
+  s32 off = (s32)(target - Addr(site));
+  *site = 0x48000000 | ((u32)off & 0x03FFFFFC);
+  FlushCode(site, 1);
+}
 
 constexpr u32 MAX_IDS = 1u << 20;
 u32* s_entries = nullptr;    // block id -> code address (0: not compiled)
@@ -328,6 +342,7 @@ void Reset() {
   FlushCode(s_code, e.code.size());
   s_used = e.code.size();
   memset(s_entries, 0, MAX_IDS * sizeof(u32));
+  s_incoming.clear();
 }
 
 // ---- Inlined instructions ----
@@ -955,6 +970,15 @@ bool EmitFpFast(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
 // Branches (always the last instruction of a block). On return r28 holds the
 // next pc. The forms that the interpreter uses for idle-loop detection
 // ("b ." and bc -8) are left to the interpreter.
+// Static exit emitter supplied by Compile: leaves the block towards
+// r28 + offset (bookkeeping, budget check, linkable jump).
+struct StaticExits {
+  bool enabled = false;  // false: CanInline statistics only
+  u32 inst_pa = 0;       // physical address of the branch instruction
+  std::function<void(s32 offset, u32 target_pa)> emit;
+};
+StaticExits* s_static = nullptr;
+
 bool EmitBranch(PPCEmitter& e, u32 inst) {
   u32 op = inst >> 26;
   bool lk = inst & 1, aa = inst & 2;
@@ -965,6 +989,10 @@ bool EmitBranch(PPCEmitter& e, u32 inst) {
     if (lk) {
       e.addi(4, R_PC, 4);
       e.stw(4, OFF_LR, R_CPU);
+    }
+    if (!aa && s_static && s_static->enabled) {
+      s_static->emit(li, s_static->inst_pa + (u32)li);
+      return true;
     }
     if (aa) {
       e.LoadImm(R_PC, (u32)li);
@@ -999,6 +1027,22 @@ bool EmitBranch(PPCEmitter& e, u32 inst) {
     e.rlwinm(6, 6, (bi + 1) & 31, 31, 31);
     e.cmpwi(0, 6, (s32)((bo >> 3) & 1));
     fail.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_EQ));
+  }
+  // relative bc with static exits: one linkable exit per outcome
+  if (is_bc && !aa && s_static && s_static->enabled) {
+    if (lk) {
+      e.addi(4, R_PC, 4);
+      e.stw(4, OFF_LR, R_CPU);
+    }
+    s_static->emit(bd, s_static->inst_pa + (u32)bd);
+    u32 fail_at = e.Here();
+    for (u32 f : fail) e.PatchBranchTo(f, fail_at);
+    if (lk) {
+      e.addi(4, R_PC, 4);
+      e.stw(4, OFF_LR, R_CPU);
+    }
+    s_static->emit(4, s_static->inst_pa + 4);
+    return true;
   }
   // taken
   if (is_bc) {
@@ -1218,7 +1262,21 @@ void Run(u32 id) {
   ((EnterFn)(void*)(s_code + s_enter))(s_entries[id]);
 }
 
-bool Compile(u32 id, const u32* insts, const Interpreter::OpFn* fns, u32 count) {
+void Unlink(u32 pa, u32 len) {
+  if (!s_code) return;
+  u32 dispatch = Addr(s_code + s_dispatch);
+  for (auto it = s_incoming.lower_bound(pa); it != s_incoming.end() && it->first < pa + len; ++it)
+    for (u32* site : it->second) PatchBranch(site, dispatch);
+}
+
+void UnlinkAll() {
+  if (!s_code) return;
+  u32 dispatch = Addr(s_code + s_dispatch);
+  for (auto& kv : s_incoming)
+    for (u32* site : kv.second) PatchBranch(site, dispatch);
+}
+
+bool Compile(u32 id, u32 block_pa, const u32* insts, const Interpreter::OpFn* fns, u32 count) {
   if (!s_enabled || !s_map || id >= MAX_IDS) return true;  // stays interpreted
   if (!s_code) {
     if (!AllocCode()) {
@@ -1250,6 +1308,34 @@ bool Compile(u32 id, const u32* insts, const Interpreter::OpFn* fns, u32 count) 
     e.PatchBranchTo(skip, e.Here());
   };
   std::vector<u32> exhaust;  // budget exhausted after an inlined instruction -> exit
+  struct LinkSite {
+    u32 at;
+    u32 target_pa;
+  };
+  std::vector<LinkSite> links;
+  // Leaves the block for a statically known target (same 128 KiB BAT block
+  // as this one, so the translation is linear): linkable jump.
+  auto linkable_jump = [&](u32 target_pa) {
+    if ((target_pa >> 17) == (block_pa >> 17) && target_pa < Mem::MEM1_SIZE && !(target_pa & 3))
+      links.push_back({e.Here(), target_pa});
+    jump(s_dispatch);
+  };
+  StaticExits sx;
+  sx.enabled = s_inline_enabled;
+  sx.emit = [&](s32 offset, u32 target_pa) {
+    if (offset >= -32768 && offset < 32768) {
+      e.addi(R_PC, R_PC, offset);
+    } else {
+      e.LoadImm(4, (u32)offset);
+      e.add(R_PC, R_PC, 4);
+    }
+    e.addi(R_PENDING, R_PENDING, 1);
+    e.Emit(PPCEmitter::D(13, R_BUDGET, R_BUDGET, -1));  // addic. r30, r30, -1
+    CacheWriteBack(e);
+    jump_unless(PPCEmitter::BO_TRUE, PPCEmitter::CR0_GT, s_exit);  // end of the slice
+    linkable_jump(target_pa);
+  };
+  s_static = &sx;
 
   PlanCache(insts, count);
   if (!s_inline_enabled) memset(s_cache, 0, sizeof(s_cache));
@@ -1265,11 +1351,21 @@ bool Compile(u32 id, const u32* insts, const Interpreter::OpFn* fns, u32 count) 
     std::vector<u32> slow;
     bool fast = false;
     if (s_inline_enabled) {
+      sx.inst_pa = block_pa + 4 * k;
+      u32 before = e.Here();
       if (last && EmitBranch(e, insts[k])) {
-        e.addi(R_PENDING, R_PENDING, 1);
-        e.Emit(PPCEmitter::D(13, R_BUDGET, R_BUDGET, -1));  // addic. r30, r30, -1
-        CacheWriteBack(e);
-        jump(s_dispatch);
+        // static exits emitted their own tails; dynamic targets (bclr, bcctr,
+        // absolute) go through the dispatcher
+        bool static_tail = !links.empty() && links.back().at >= before;
+        bool any_static_jump = false;
+        for (const Jump& j : jumps)
+          if (j.at >= before && j.target == s_dispatch) any_static_jump = true;
+        if (!static_tail && !any_static_jump) {
+          e.addi(R_PENDING, R_PENDING, 1);
+          e.Emit(PPCEmitter::D(13, R_BUDGET, R_BUDGET, -1));  // addic. r30, r30, -1
+          CacheWriteBack(e);
+          jump(s_dispatch);
+        }
         ended = true;
         continue;
       }
@@ -1318,9 +1414,9 @@ bool Compile(u32 id, const u32* insts, const Interpreter::OpFn* fns, u32 count) 
       }
     }
   }
-  if (!ended) {  // end of the block after an inlined instruction
+  if (!ended) {  // end of the block after an inlined instruction: falls into the next one
     CacheWriteBack(e);
-    jump(s_dispatch);
+    linkable_jump(block_pa + 4 * count);
   }
   if (!exhaust.empty()) {
     u32 at = e.Here();
@@ -1329,6 +1425,7 @@ bool Compile(u32 id, const u32* insts, const Interpreter::OpFn* fns, u32 count) 
     jump(s_exit);
   }
 
+  s_static = nullptr;
   if (s_used + e.code.size() > CODE_SIZE / 4) return false;
   u32* dst = s_code + s_used;
   for (const Jump& j : jumps) {
@@ -1339,6 +1436,29 @@ bool Compile(u32 id, const u32* insts, const Interpreter::OpFn* fns, u32 count) 
   FlushCode(dst, e.code.size());
   s_used += e.code.size();
   s_entries[id] = Addr(dst);
+  s_static = nullptr;
+  // Link this block's static exits to compiled targets, and the exits waiting
+  // for this block to it.
+  for (const LinkSite& l : links) {
+    u32* site = dst + l.at;
+    s_incoming[l.target_pa].push_back(site);
+    u32 tid = s_map[l.target_pa >> 2];
+    if (tid && tid < MAX_IDS && s_entries[tid]) PatchBranch(site, s_entries[tid]);
+  }
+  auto inc = s_incoming.find(block_pa);
+  if (inc != s_incoming.end())
+    for (u32* site : inc->second) PatchBranch(site, Addr(dst));
+  // Debugging: EMUGC_JIT_DUMP=N writes block N (guest, then host code) to jit_block.bin
+  static int dump_at = getenv("EMUGC_JIT_DUMP") ? atoi(getenv("EMUGC_JIT_DUMP")) : -1;
+  if ((int)id == dump_at) {
+    if (FILE* f = fopen("jit_block.bin", "wb")) {
+      u32 hdr[2] = {count, (u32)e.code.size()};
+      fwrite(hdr, 4, 2, f);
+      fwrite(insts, 4, count, f);
+      fwrite(e.code.data(), 4, e.code.size(), f);
+      fclose(f);
+    }
+  }
   return true;
 }
 

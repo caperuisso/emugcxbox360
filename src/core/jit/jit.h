@@ -31,7 +31,12 @@ void Clear();
 // Compiles block `id` (as stored in the map). Returns false when out of code
 // space (the caller then clears the cache); blocks that cannot be compiled
 // stay interpreted.
-bool Compile(u32 id, const u32* insts, const Interpreter::OpFn* fns, u32 count);
+bool Compile(u32 id, u32 pa, const u32* insts, const Interpreter::OpFn* fns, u32 count);
+
+// Code at physical [pa, pa + len) changed: jumps linked into it go back to the dispatcher.
+void Unlink(u32 pa, u32 len);
+// Address translation changed: unlink everything.
+void UnlinkAll();
 bool HasBlock(u32 id);
 
 // Whether `inst` gets host code (statistics; `last` = last instruction of its block).

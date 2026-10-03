@@ -87,7 +87,7 @@ Block* Compile(u32 pa) {
       insts[k] = s_code[b.first + k].inst;
       fns[k] = s_code[b.first + k].fn;
     }
-    if (!Jit::Compile((u32)s_blocks.size(), insts, fns, b.count)) s_jit_full = true;
+    if (!Jit::Compile((u32)s_blocks.size(), pa, insts, fns, b.count)) s_jit_full = true;
   }
   s_page_used[pa >> PAGE_SHIFT] = 1;
   return &s_blocks.back();
@@ -115,6 +115,7 @@ void Invalidate(u32 pa, u32 len) {
   if (!s_map || !len) return;
   pa &= 0x1FFFFFFF;
   if (pa >= Mem::MEM1_SIZE) return;
+  Jit::Unlink(pa, len);
   u32 end = pa + len > Mem::MEM1_SIZE ? Mem::MEM1_SIZE : pa + len;
   for (u32 page = pa >> PAGE_SHIFT; page <= (end - 1) >> PAGE_SHIFT; page++) {
     if (!s_page_used[page]) continue;

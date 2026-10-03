@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "core/memory.h"
+#include "core/jit/jit.h"
 
 #include <cstdlib>
 
@@ -176,6 +177,7 @@ void DoState(StateBuffer& s) {
 }
 
 void UpdateBATs() {
+  Jit::UnlinkAll();
   BuildTable(s_ibat, SPR_IBAT0U);
   BuildTable(s_dbat, SPR_DBAT0U);
 }
