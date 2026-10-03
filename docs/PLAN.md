@@ -38,6 +38,13 @@ the PC (reference images, qemu-ppc big-endian runs) before going to the console.
 - Each version verified bit-identical to the interpreter over 300-1500 WW fields under qemu-ppc.
 - [ ] Quantized psq types (u8/s16 with scale), remaining interpreted instructions
 
+## Multi-core (Xenon: 3 cores x 2 threads)
+- [x] Dual core: GX command processing, vertex transform and the Xenos backend on hardware
+      thread 2 (core 1); the CPU thread queues FIFO bytes and syncs where it observes GX results
+      (PE registers, EFB access, presenting a field, idle loops, save states). PE interrupts are
+      delivered at those points: deterministic, same pictures as single core on the WW title/menu
+- [ ] Audio DSP on core 2 (measured small on the PC: low priority)
+
 ## Other
 - [ ] Save states are host-endian (a PC state does not load on the 360 / PPC build)
 - [x] VI line event only on interesting lines; 200k-cycle slices (identical output)

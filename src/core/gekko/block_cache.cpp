@@ -160,10 +160,7 @@ void Run() {
         break;
       }
       cpu.pc = cpu.npc;
-      if (UNLIKELY(CPU::g_idle)) {
-        CPU::g_idle = false;
-        if (CPU::g_idle_skipping && cpu.cycles < CoreTiming::g_slice_end) cpu.cycles = CoreTiming::g_slice_end;
-      }
+      if (UNLIKELY(CPU::g_idle)) CPU::OnIdle();
       if (cpu.npc != pc + 4 || cpu.cycles >= CoreTiming::g_slice_end) break;
     }
   }

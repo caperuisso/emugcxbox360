@@ -64,10 +64,10 @@ XenosShader* CreateShader(const Xenos::BuiltShader& b) {
 // Tiny 3x5 font for the performance overlay, drawn into the uploaded image.
 // Lines are separated by '\n'.
 void DrawOverlay(uint32_t* pixels, int pitch_px, int w, int h, const char* text) {
-  static const char kChars[] = "0123456789.% FPSDCGAV";
+  static const char kChars[] = "0123456789.% FPSDCGAVX";
   static const uint16_t kGlyphs[] = {0x7B6F, 0x2C97, 0x73E7, 0x73CF, 0x5BC9, 0x79CF, 0x79EF, 0x7249, 0x7BEF,
                                      0x7BCF, 0x0002, 0x52A5, 0x0000, 0x79E4, 0x7BE4, 0x79CF, 0x6B6E, 0x7927,
-                                     0x796F, 0x2BED, 0x5B6A};
+                                     0x796F, 0x2BED, 0x5B6A, 0x5AAD};
   const int scale = 2, ox = 4, oy = 3;
   for (int y = 0; y < h; y++)
     for (int x = 0; x < w; x++) pixels[y * pitch_px + x] = 0xFF000000;

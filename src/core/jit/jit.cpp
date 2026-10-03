@@ -52,10 +52,7 @@ void HelperException() {
   CPU::CheckExceptions();
 }
 
-void HelperIdle() {
-  CPU::g_idle = false;
-  if (CPU::g_idle_skipping && cpu.cycles < CoreTiming::g_slice_end) cpu.cycles = CoreTiming::g_slice_end;
-}
+void HelperIdle() { CPU::OnIdle(); }
 
 inline u32 Addr(const void* p) { return (u32)(uintptr_t)p; }
 

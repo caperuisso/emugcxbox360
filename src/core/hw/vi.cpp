@@ -69,6 +69,7 @@ inline u8 Clamp8(int v) { return v < 0 ? 0 : (v > 255 ? 255 : (u8)v); }
 
 void PresentXFB() {
   if (!g_host) return;
+  GX::Sync();  // the copies of this field are done (and the GPU is free)
   Prof::Scope prof(Prof::VI);
   u32 wpl = (R(PICCONF) >> 8) & 0x7F;  // width in 16-pixel units
   u32 std = R(PICCONF) & 0xFF;         // stride in 16-pixel units

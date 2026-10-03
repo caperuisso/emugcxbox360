@@ -9,6 +9,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#ifndef EMUGC_NO_THREADS
+#include <thread>
+#endif
 
 #include "core/memory.h"
 #include "core/system.h"
@@ -61,6 +64,12 @@ class HeadlessHost : public Host {
     }
     (void)rate;
   }
+#ifndef EMUGC_NO_THREADS
+  bool StartThread(void (*fn)(void*), void* arg) override {
+    std::thread(fn, arg).detach();
+    return true;
+  }
+#endif
   std::string memcard;  // EMUGC_MEMCARD
   std::string MemcardPath(int slot) override { return slot == 0 ? memcard : std::string(); }
 
@@ -90,6 +99,7 @@ int main(int argc, char** argv) {
     printf("boot failed\n");
     return 1;
   }
+  if (getenv("EMUGC_DUAL") && !System::EnableDualCore()) printf("dual core unavailable\n");
   if (const char* st = getenv("EMUGC_STATE")) {
     if (!System::LoadState(st)) {
       printf("state load failed\n");

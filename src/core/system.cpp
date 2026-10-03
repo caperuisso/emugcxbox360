@@ -58,12 +58,14 @@ bool Init(Host* host) {
 }
 
 void Shutdown() {
+  GX::StopThread();
   DI::CloseDisc();
   Mem::Shutdown();
   s_initialized = false;
 }
 
 bool Boot(const std::string& path) {
+  GX::Sync();  // nothing may still be rendering from the previous game
   CoreTiming::Init();
   Mem::Clear();
   BootCheckpoint("Mem::Clear");
@@ -81,6 +83,7 @@ namespace {
 constexpr char STATE_MAGIC[8] = {'E', 'M', 'U', 'G', 'C', 'S', 'T', '1'};
 
 void DoMachineState(StateBuffer& s) {
+  GX::Sync();  // the GX thread must not touch RAM or GX state meanwhile
   CPU::DoState(s);
   Mem::DoState(s);
   CoreTiming::DoState(s);
@@ -136,6 +139,8 @@ bool LoadState(const std::string& path) {
   LOG("State: loaded %s\n", path.c_str());
   return true;
 }
+
+bool EnableDualCore() { return GX::StartThread(); }
 
 void RunFrame() {
   VI::g_field_done = false;

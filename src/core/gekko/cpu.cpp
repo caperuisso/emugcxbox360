@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "core/gekko/cpu.h"
+#include "core/hw/hw.h"
 
 #include "core/coretiming.h"
 #include "core/gekko/block_cache.h"
@@ -107,6 +108,15 @@ static inline void ExecuteOne() {
   cpu.pc = cpu.npc;
 }
 
+void OnIdle() {
+  g_idle = false;
+  if (GX::Threaded()) {
+    GX::Sync();
+    if ((cpu.exceptions & EXC_EXTERNAL) && (cpu.msr & MSR_EE)) return;  // taken by the next instruction
+  }
+  if (g_idle_skipping && cpu.cycles < CoreTiming::g_slice_end) cpu.cycles = CoreTiming::g_slice_end;
+}
+
 void Run() {
   if (BlockCache::g_enabled) {
     BlockCache::Run();
@@ -116,10 +126,7 @@ void Run() {
   if (cpu.exceptions) CheckExceptions();
   while (cpu.cycles < CoreTiming::g_slice_end) {
     ExecuteOne();
-    if (UNLIKELY(g_idle)) {
-      g_idle = false;
-      if (g_idle_skipping && cpu.cycles < CoreTiming::g_slice_end) cpu.cycles = CoreTiming::g_slice_end;
-    }
+    if (UNLIKELY(g_idle)) OnIdle();
   }
 }
 

@@ -150,6 +150,10 @@ extern u32 g_cycles_per_instruction;
 // Set by the interpreter when it detects an idle polling loop.
 extern bool g_idle;
 extern bool g_idle_skipping;  // option, on by default
+// Handles g_idle after the instruction that set it: skips to the end of the
+// time slice unless an interrupt became deliverable (dual core: once the GX
+// thread has caught up, since the loop is usually waiting for it).
+void OnIdle();
 
 }  // namespace CPU
 

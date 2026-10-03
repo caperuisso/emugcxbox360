@@ -134,4 +134,17 @@ u16 PERead16(u32 off);
 void PEWrite16(u32 off, u16 v);
 // Feeds raw FIFO bytes to the command parser.
 void ProcessFifo(const u8* data, u32 len);
+
+// Dual core: the command stream is parsed and rendered on another host
+// thread. ProcessFifo then only queues the bytes; Sync() waits until the
+// GX thread has consumed everything queued and delivers the Pixel Engine
+// interrupts it raised. The CPU thread calls it wherever it observes GX
+// results (PE registers, EFB access, presenting a field, idle loops, save
+// states), so those points see the same state as with a single thread.
+bool StartThread();
+void StopThread();
+bool Threaded();
+void Sync();
+// Host ticks (Prof::Now) the GX thread spent working, wrapping 32-bit total.
+u32 BusyTicks();
 }  // namespace GX

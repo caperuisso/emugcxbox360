@@ -46,6 +46,9 @@ class Host {
   virtual void RunParallel(int tasks, void (*fn)(int task, int tasks, void* ctx), void* ctx) {
     for (int i = 0; i < tasks; i++) fn(i, tasks, ctx);
   }
+  // Starts fn(arg) on another host thread, ideally on its own core (the GX
+  // thread in dual-core mode). The thread returns when the core stops it.
+  virtual bool StartThread(void (*fn)(void* arg), void* arg) { (void)fn; (void)arg; return false; }
   // Called at boot milestones (diagnostics).
   virtual void Checkpoint(const char* where) { (void)where; }
   virtual void CodeGuard(const char* where) { (void)where; }

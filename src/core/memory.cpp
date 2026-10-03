@@ -79,6 +79,7 @@ T ReadPhys(u32 pa) {
     return (T)(((u64)HW::Read32(pa) << 32) | HW::Read32(pa + 4));
   }
   if ((pa & 0xFF000000) == 0x08000000) {  // EFB peek
+    GX::Sync();
     u32 x = (pa & 0xFFF) >> 2, y = (pa >> 12) & 0x3FF;
     u32 v = (pa & 0x400000) ? Video::PeekEFBDepth(x, y) : Video::PeekEFBColor(x, y);
     return (T)v;
@@ -118,6 +119,7 @@ void WritePhys(u32 pa, T v) {
     return;
   }
   if ((pa & 0xFF000000) == 0x08000000) {  // EFB poke
+    GX::Sync();
     u32 x = (pa & 0xFFF) >> 2, y = (pa >> 12) & 0x3FF;
     if (pa & 0x400000)
       Video::PokeEFBDepth(x, y, (u32)v);

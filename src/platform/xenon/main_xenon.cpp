@@ -29,6 +29,7 @@ int bdev_enum(int handle, const char** name);
 #include "core/prof.h"
 #include "platform/xenon/xenos_gpu.h"
 #include "core/system.h"
+#include "core/hw/hw.h"
 
 namespace {
 
@@ -65,13 +66,36 @@ void WorkerLoop() {
   }
 }
 
-bool StartWorkers() {
+// ---- Dual core: the GX thread on hardware thread 2 (core 1, alone) ----
+constexpr int kGxHwThread = 2;
+bool g_gx_thread_started = false;
+void (*g_gx_fn)(void*) = nullptr;
+void* g_gx_arg = nullptr;
+
+void GxThreadEntry() { g_gx_fn(g_gx_arg); }
+
+bool StartGxThread(void (*fn)(void*), void* arg) {
+  xenon_thread_startup();
+  const int stack_size = 1024 * 1024;
+  u8* stack = (u8*)memalign(128, stack_size);
+  if (!stack) return false;
+  g_gx_fn = fn;
+  g_gx_arg = arg;
+  __sync_synchronize();
+  if (xenon_run_thread_task(kGxHwThread, stack + stack_size - 256, (void*)GxThreadEntry) != 0) return false;
+  g_gx_thread_started = true;
+  return true;
+}
+
+// reserve_gx: leaves hardware thread 2 to the GX thread (dual core)
+bool StartWorkers(bool reserve_gx) {
   xenon_thread_startup();
   const int stack_size = 256 * 1024;
   for (int t = 1; t <= 5; t++) {
+    if (t == kGxHwThread && reserve_gx) continue;
     u8* stack = (u8*)memalign(128, stack_size);
     if (!stack || xenon_run_thread_task(t, stack + stack_size - 256, (void*)WorkerLoop) != 0) break;
-    g_worker_count = t + 1;
+    g_worker_count++;
   }
   printf("Renderer threads: %d\n", g_worker_count);
   return g_worker_count > 1;
@@ -172,6 +196,8 @@ class XenonHost : public Host {
   void Log(const char* msg) override { printf("%s", msg); }
   void Checkpoint(const char* where) override { CheckText(where); }
   void CodeGuard(const char* where) override { GuardText(where); }
+
+  bool StartThread(void (*fn)(void*), void* arg) override { return StartGxThread(fn, arg); }
 
   int ParallelWorkers() override { return g_worker_count; }
   void RunParallel(int tasks, void (*fn)(int, int, void*), void* ctx) override {
@@ -343,6 +369,7 @@ void ScanDir(const std::string& dir, std::vector<std::string>& out) {
 bool g_use_threads = false;
 bool g_use_gpu = true;
 bool g_gpu_render = true;  // GX rasterization on the GPU (needs the GPU display)
+bool g_dual_core = true;   // GX on its own core
 
 std::string PickGame() {
   std::vector<std::string> games;
@@ -365,7 +392,8 @@ std::string PickGame() {
       printf("emugcxbox360 - choose a game\n");
       printf("  A: start   X: multi-thread software renderer %s   Y: GPU display %s   B: GPU rendering %s\n",
              g_use_threads ? "ON" : "OFF", g_use_gpu ? "ON" : "OFF", g_gpu_render && g_use_gpu ? "ON" : "OFF");
-      printf("  Start: CPU recompiler (JIT) %s   Guide: quit\n\n", Jit::Enabled() ? "ON" : "OFF");
+      printf("  Start: CPU recompiler (JIT) %s   RB: dual core (GX on core 2) %s   Guide: quit\n\n",
+             Jit::Enabled() ? "ON" : "OFF", g_dual_core ? "ON" : "OFF");
       int first = std::max(0, sel - 10);
       for (int i = first; i < (int)games.size() && i < first + 20; i++)
         printf("%s %s\n", i == sel ? ">" : " ", games[i].c_str());
@@ -395,6 +423,12 @@ std::string PickGame() {
       shown = -1;
     }
     start_was_down = c.start;
+    static bool rb_was_down = false;
+    if (c.rb && !rb_was_down) {
+      g_dual_core = !g_dual_core;
+      shown = -1;
+    }
+    rb_was_down = c.rb;
     static bool b_was_down = false;
     if (c.b && !b_was_down) {
       g_gpu_render = !g_gpu_render;
@@ -457,7 +491,7 @@ int main() {
   CheckText("game picker");
   if (game.empty()) return 0;
 
-  if (g_use_threads) StartWorkers();
+  if (g_use_threads) StartWorkers(g_dual_core);
   host.Attach();
   host.memcard_dir = game.substr(0, game.rfind('/') + 1);  // card lives next to the game
   if (!System::Init(&host) || !System::Boot(game)) {
@@ -469,6 +503,8 @@ int main() {
   console_close();   // the emulated picture owns the framebuffer from now on
   if (g_use_gpu) host.gpu = XenosGpu::Init();
   if (host.gpu && g_gpu_render) XenosGpu::InstallBackend();
+  // after the backend: the GX thread renders through it from the first command
+  if (g_dual_core) printf("Dual core: %s\n", System::EnableDualCore() ? "on" : "unavailable");
 
   u64 stats_start = mftb();
   int stats_fields = 0;
@@ -511,6 +547,14 @@ int main() {
       char prof[64];
       snprintf(prof, sizeof(prof), "C%d G%d A%d V%d", (int)(t[Prof::CPU] * 100 / total),
                (int)(t[Prof::GX] * 100 / total), (int)(t[Prof::DSP] * 100 / total), (int)(t[Prof::VI] * 100 / total));
+      if (GX::Threaded()) {  // X = load of the GX thread (dual core); G is then the wait for it
+        static u32 last_busy = 0;
+        u32 busy = GX::BusyTicks();
+        int x = (int)((u64)(u32)(busy - last_busy) * 100 / total);
+        last_busy = busy;
+        size_t len = strlen(prof);
+        snprintf(prof + len, sizeof(prof) - len, " X%d", x);
+      }
       printf("[perf] %s %s\n", host.overlay, prof);
       if (host.gpu) {
         char both[96];

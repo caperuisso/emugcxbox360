@@ -14,6 +14,10 @@ void Shutdown();
 // Resets the machine and boots a .dol / .iso / .gcm file.
 bool Boot(const std::string& path);
 
+// Dual core: GX command processing and rendering on another host thread
+// (Host::StartThread). False when the host has no thread for it.
+bool EnableDualCore();
+
 // Emulates until the VI finishes the next field (~1/60 s of guest time).
 void RunFrame();
 

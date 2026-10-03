@@ -65,6 +65,16 @@ inline To BitCast(const From& f) {
   return t;
 }
 
+// Busy-wait hint between two polls of memory shared with another thread
+// (on the Xenon: lowers this hardware thread's priority on its core).
+inline void SpinPause() {
+#if defined(__powerpc__) || defined(__PPC__)
+  __asm__ volatile("or 1,1,1\n\tor 2,2,2" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#endif
+}
+
 // Timing constants (GameCube)
 constexpr u32 CPU_CLOCK = 486000000;  // Gekko core clock
 constexpr u32 BUS_CLOCK = 162000000;  // Flipper bus clock
