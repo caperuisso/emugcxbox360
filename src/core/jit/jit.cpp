@@ -472,6 +472,28 @@ bool EmitInline(PPCEmitter& e, u32 inst) {
       StoreGpr(e, 6, rd);
       if (op == 13) UpdateGuestCR(e, 0);
       return true;
+    case 19: {  // CR logical operations on the cached CR
+      u32 xo = (inst >> 1) & 0x3FF, host_xo;
+      switch (xo) {
+        case 257: host_xo = 28; break;   // crand  -> and
+        case 129: host_xo = 60; break;   // crandc -> andc
+        case 289: host_xo = 284; break;  // creqv  -> eqv
+        case 225: host_xo = 476; break;  // crnand -> nand
+        case 33: host_xo = 124; break;   // crnor  -> nor
+        case 449: host_xo = 444; break;  // cror   -> or
+        case 417: host_xo = 412; break;  // crorc  -> orc
+        case 193: host_xo = 316; break;  // crxor  -> xor
+        default: return false;
+      }
+      u32 bd = rd, ba = ra, bb = rb;
+      LoadCR(e, 5);
+      e.rlwinm(3, 5, (ba + 1) & 31, 31, 31);
+      e.rlwinm(4, 5, (bb + 1) & 31, 31, 31);
+      e.Emit(PPCEmitter::X(31, 3, 6, 4, host_xo));  // r6 = r3 op r4 (bit 0 matters)
+      e.rlwimi(5, 6, (31 - bd) & 31, bd, bd);
+      StoreCR(e, 5);
+      return true;
+    }
     case 10:  // cmpli
     case 11:  // cmpi
     {
@@ -571,19 +593,21 @@ bool EmitInline(PPCEmitter& e, u32 inst) {
           UpdateGuestCR(e, crf);
           return true;
         }
-        case 467: {  // mtspr LR / CTR
+        case 467: {  // mtspr without side effects (see Interpreter::WriteSPR)
           u32 spr = ((inst >> 16) & 31) | (((inst >> 11) & 31) << 5);
-          if (spr != SPR_LR && spr != SPR_CTR) return false;
+          if (spr == SPR_DEC || spr == SPR_TBL_W || spr == SPR_TBU_W || spr == SPR_PVR || spr == SPR_WPAR ||
+              spr == SPR_DMAL || (spr >= SPR_IBAT0U && spr < SPR_IBAT0U + 16) || spr >= 1024)
+            return false;
           LoadGpr(e, 3, rd);
-          e.stw(3, OFF_SPR + (s32)spr * 4, R_CPU);
+          e.stw(3, spr == SPR_XER ? OFF_XER : OFF_SPR + (s32)spr * 4, R_CPU);
           return true;
         }
         case 54: case 86: case 246: case 278: case 470: case 310: case 438:  // cache hints: no-ops
           return true;
-        case 339: {  // mfspr LR / CTR
+        case 339: {  // mfspr without side effects (see Interpreter::ReadSPR)
           u32 spr = ((inst >> 16) & 31) | (((inst >> 11) & 31) << 5);
-          if (spr != SPR_LR && spr != SPR_CTR) return false;
-          e.lwz(6, OFF_SPR + (s32)spr * 4, R_CPU);
+          if (spr == SPR_DEC || spr == SPR_TBL_R || spr == SPR_TBU_R || spr == SPR_WPAR || spr >= 1024) return false;
+          e.lwz(6, spr == SPR_XER ? OFF_XER : OFF_SPR + (s32)spr * 4, R_CPU);
           StoreGpr(e, 6, rd);
           return true;
         }
@@ -607,7 +631,7 @@ constexpr bool kFused = false;
 constexpr bool kFused = true;
 #endif
 
-enum FpKind { FK_ADD, FK_SUB, FK_MUL, FK_DIV, FK_MADD, FK_MSUB, FK_NMADD, FK_NMSUB };
+enum FpKind { FK_ADD, FK_SUB, FK_MUL, FK_DIV, FK_MADD, FK_MSUB, FK_NMADD, FK_NMSUB, FK_COPYC };
 struct FpTerm {
   FpKind kind;
   int a, b, c;  // operand halves (0 = ps0, 1 = ps1), -1 = unused
@@ -648,6 +672,8 @@ bool DecodeFpOp(u32 inst, FpOp& f) {
       return true;
     }
     switch (xo5) {
+      case 10: f = {2, true, {FK_ADD, 0, 1, -1}, {FK_COPYC, -1, -1, 1}}; return true;   // ps_sum0
+      case 11: f = {2, true, {FK_COPYC, -1, -1, 0}, {FK_ADD, 0, 1, -1}}; return true;   // ps_sum1
       case 12: f = {2, true, {FK_MUL, 0, -1, 0}, {FK_MUL, 1, -1, 0}}; return true;      // ps_muls0
       case 13: f = {2, true, {FK_MUL, 0, -1, 1}, {FK_MUL, 1, -1, 1}}; return true;      // ps_muls1
       case 14: f = {2, true, {FK_MADD, 0, 0, 0}, {FK_MADD, 1, 1, 0}}; return true;      // ps_madds0
@@ -662,7 +688,12 @@ bool DecodeFpOp(u32 inst, FpOp& f) {
 void EmitFpTerm(PPCEmitter& e, u32 inst, const FpTerm& t, bool round) {
   u32 ra = Field(inst, 16), rb = Field(inst, 11), rc = Field(inst, 6);
   auto fpr = [](u32 r, int half) { return OFF_FPR + (s32)r * 16 + half * 8; };
-  bool uses_c = t.kind == FK_MUL || t.kind >= FK_MADD;
+  if (t.kind == FK_COPYC) {
+    e.lfd(0, fpr(rc, t.c), R_CPU);
+    if (round) e.Emit(PPCEmitter::X(63, 0, 0, 0, 12));  // frsp
+    return;
+  }
+  bool uses_c = t.kind == FK_MUL || (t.kind >= FK_MADD && t.kind <= FK_NMSUB);
   bool uses_b = t.kind != FK_MUL;
   e.lfd(1, fpr(ra, t.a), R_CPU);
   if (uses_b) e.lfd(2, fpr(rb, t.b), R_CPU);
@@ -853,6 +884,24 @@ bool EmitFpMove(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
   return true;
 }
 
+// fctiwz: the host conversion saturates and handles NaN like the interpreter;
+// the high word is the interpreter's constant.
+bool EmitFctiwz(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
+  if ((inst >> 26) != 63 || ((inst >> 1) & 0x3FF) != 15 || (inst & 1)) return false;
+  u32 rd = Field(inst, 21), rb = Field(inst, 11);
+  e.lwz(0, OFF_MSR, R_CPU);
+  e.andi_(0, 0, MSR_FP);
+  slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+  e.lfd(0, OFF_FPR + (s32)rb * 16, R_CPU);
+  e.Emit(PPCEmitter::X(63, 0, 0, 0, 15));  // fctiwz f0, f0
+  e.stfd(0, 8, 1);                         // scratch slot in our stack frame
+  e.lwz(3, 12, 1);
+  e.LoadImm(4, 0xFFF80000);
+  e.stw(4, OFF_FPR + (s32)rd * 16, R_CPU);
+  e.stw(3, OFF_FPR + (s32)rd * 16 + 4, R_CPU);
+  return true;
+}
+
 // fcmpu / fcmpo: the host comparison yields the same LT GT EQ UN code
 bool EmitFpCompare(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
   u32 op = inst >> 26, xo = (inst >> 1) & 0x3FF;
@@ -880,6 +929,7 @@ bool EmitFpCompare(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
 bool EmitFpFast(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
   if (EmitFpMove(e, inst, slow)) return true;
   if (EmitFpCompare(e, inst, slow)) return true;
+  if (EmitFctiwz(e, inst, slow)) return true;
   FpOp f;
   if ((inst & 1) || !DecodeFpOp(inst, f)) return false;  // Rc forms are left to the interpreter
   u32 rd = Field(inst, 21);
@@ -1149,6 +1199,17 @@ void Clear() {
   if (s_code) Reset();
 }
 size_t CodeBytes() { return s_used * 4; }
+
+bool CanInline(u32 inst, bool last) {
+  PPCEmitter e;
+  std::vector<u32> slow;
+  memset(s_cache, 0, sizeof(s_cache));
+  s_cr_cached = false;
+  MemOp m;
+  if (last && EmitBranch(e, inst)) return true;
+  if (DecodeMemOp(inst, m)) return true;
+  return EmitFpFast(e, inst, slow) || EmitPsqFast(e, inst, slow) || EmitInline(e, inst);
+}
 
 bool HasBlock(u32 id) { return s_entries && id < MAX_IDS && s_entries[id]; }
 

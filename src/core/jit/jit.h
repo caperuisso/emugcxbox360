@@ -34,6 +34,9 @@ void Clear();
 bool Compile(u32 id, const u32* insts, const Interpreter::OpFn* fns, u32 count);
 bool HasBlock(u32 id);
 
+// Whether `inst` gets host code (statistics; `last` = last instruction of its block).
+bool CanInline(u32 inst, bool last);
+
 // Runs generated code from block `id` (at cpu.pc, compiled) until the end of
 // the time slice or something the generated code does not handle.
 void Run(u32 id);
