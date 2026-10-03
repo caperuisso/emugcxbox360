@@ -15,6 +15,7 @@ enum Cat { OTHER, CPU, GX, DSP, VI, NUM_CATS };
 extern u64 g_ticks[NUM_CATS];
 
 u64 Now();  // host ticks (timebase on the Xbox 360, nanoseconds elsewhere)
+u64 TicksPerSecond();
 Cat Switch(Cat c);
 
 struct Scope {

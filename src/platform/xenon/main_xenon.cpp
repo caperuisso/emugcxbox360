@@ -30,6 +30,7 @@ int bdev_enum(int handle, const char** name);
 #include "platform/xenon/xenos_gpu.h"
 #include "core/system.h"
 #include "core/hw/hw.h"
+#include "core/gekko/cpu.h"
 
 namespace {
 
@@ -249,7 +250,7 @@ class XenonHost : public Host {
 
   void PresentFrame(const u32* argb, int w, int h) override {
     if (gpu) {
-      XenosGpu::Present(argb, w, h, overlay);
+      XenosGpu::Present(argb, w, h, nullptr);  // the overlay text is set by the main loop
       return;
     }
     if (!fb || w <= 0 || h <= 0) return;
@@ -555,11 +556,16 @@ int main() {
         size_t len = strlen(prof);
         snprintf(prof + len, sizeof(prof) - len, " X%d", x);
       }
-      printf("[perf] %s %s\n", host.overlay, prof);
+      // third line: emulated pc and the GX thread's heartbeat (changes while
+      // it runs; "D" when it stopped answering and the core went single thread)
+      char diag[40];
+      snprintf(diag, sizeof(diag), "PC %08X %04X%s", (unsigned)cpu.pc, (unsigned)(GX::Heartbeat() >> 12) & 0xFFFF,
+               GX::Abandoned() ? " D" : "");
+      printf("[perf] %s %s %s\n", host.overlay, prof, diag);
       if (host.gpu) {
-        char both[96];
-        snprintf(both, sizeof(both), "%s\n%s", host.overlay, prof);
-        XenosGpu::SetOverlay(both);
+        char all[96];
+        snprintf(all, sizeof(all), "%s\n%s\n%s", host.overlay, prof, diag);
+        XenosGpu::SetOverlay(all);
       }
       stats_start = now;
       stats_fields = 0;

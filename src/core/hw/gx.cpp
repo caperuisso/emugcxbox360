@@ -47,6 +47,8 @@ enum : u32 { ASYNC_TOKEN = 1, ASYNC_TOKEN_INT = 2, ASYNC_FINISH_INT = 4 };
 u32 s_async_flags = 0;
 u16 s_async_token = 0;
 u32 s_busy_ticks = 0;  // written by the GX thread only
+u32 s_heartbeat = 0;   // written by the GX thread only
+bool s_abandoned = false;
 
 void ProcessNow(const u8* data, u32 len);
 
@@ -152,6 +154,7 @@ void ProcessNow(const u8* data, u32 len) {
 void ThreadMain(void*) {
   __atomic_store_n(&s_running, true, __ATOMIC_RELEASE);
   while (!__atomic_load_n(&s_stop, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&s_heartbeat, s_heartbeat + 1, __ATOMIC_RELAXED);
     u32 head = __atomic_load_n(&s_head, __ATOMIC_ACQUIRE);
     u32 tail = s_tail;
     if (head == tail) {
@@ -178,6 +181,33 @@ void ApplyAsync() {
   UpdatePEInterrupts();
 }
 
+// Waits until `done()`; false when the GX thread has not moved for 5 s
+// (crashed or hung): the CPU thread then takes the command stream back.
+template <typename Done>
+bool WaitForGx(Done done) {
+  if (done()) return true;
+  Prof::Scope prof(Prof::GX);
+  u32 start = (u32)Prof::Now(), last_tail = __atomic_load_n(&s_tail, __ATOMIC_ACQUIRE);
+  const u32 limit = (u32)(Prof::TicksPerSecond() * 5);
+  while (!done()) {
+    SpinPause();
+    u32 tail = __atomic_load_n(&s_tail, __ATOMIC_ACQUIRE);
+    if (tail != last_tail) {  // progress: restart the timer
+      last_tail = tail;
+      start = (u32)Prof::Now();
+    } else if ((u32)((u32)Prof::Now() - start) > limit) {
+      LOG("GX: the GX thread stopped answering, back to a single thread\n");
+      s_abandoned = true;
+      s_threaded = false;
+      __atomic_store_n(&s_stop, true, __ATOMIC_RELEASE);
+      s_pending.clear();  // whatever it was parsing is lost
+      ApplyAsync();
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 void ProcessFifo(const u8* data, u32 len) {
@@ -190,8 +220,10 @@ void ProcessFifo(const u8* data, u32 len) {
     u32 head = s_head;
     u32 room = RING_SIZE - (head - __atomic_load_n(&s_tail, __ATOMIC_ACQUIRE));
     if (!room) {  // the GX thread is behind: wait for it
-      Prof::Scope prof(Prof::GX);
-      while (RING_SIZE - (head - __atomic_load_n(&s_tail, __ATOMIC_ACQUIRE)) == 0) SpinPause();
+      if (!WaitForGx([&] { return RING_SIZE - (head - __atomic_load_n(&s_tail, __ATOMIC_ACQUIRE)) != 0; })) {
+        ProcessNow(data, len);  // single thread from now on
+        return;
+      }
       continue;
     }
     u32 off = head & (RING_SIZE - 1);
@@ -205,12 +237,12 @@ void ProcessFifo(const u8* data, u32 len) {
 
 void Sync() {
   if (!s_threaded) return;
-  if (__atomic_load_n(&s_tail, __ATOMIC_ACQUIRE) != s_head) {
-    Prof::Scope prof(Prof::GX);
-    while (__atomic_load_n(&s_tail, __ATOMIC_ACQUIRE) != s_head) SpinPause();
-  }
+  if (!WaitForGx([] { return __atomic_load_n(&s_tail, __ATOMIC_ACQUIRE) == s_head; })) return;
   ApplyAsync();
 }
+
+u32 Heartbeat() { return __atomic_load_n(&s_heartbeat, __ATOMIC_RELAXED); }
+bool Abandoned() { return s_abandoned; }
 
 bool Threaded() { return s_threaded; }
 

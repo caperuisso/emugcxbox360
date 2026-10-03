@@ -147,4 +147,8 @@ bool Threaded();
 void Sync();
 // Host ticks (Prof::Now) the GX thread spent working, wrapping 32-bit total.
 u32 BusyTicks();
+// Diagnostics: loop counter of the GX thread (changes while it is alive), and
+// whether it stopped answering (the core then went back to a single thread).
+u32 Heartbeat();
+bool Abandoned();
 }  // namespace GX

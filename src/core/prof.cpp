@@ -25,6 +25,14 @@ u64 Now() {
 #endif
 }
 
+u64 TicksPerSecond() {
+#if defined(XENON)
+  return 50000000;  // Xenon timebase
+#else
+  return 1000000000;
+#endif
+}
+
 Cat Switch(Cat c) {
   u64 now = Now();
   g_ticks[s_cur] += (u64)(u32)(now - s_start);

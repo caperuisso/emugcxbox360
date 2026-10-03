@@ -64,10 +64,10 @@ XenosShader* CreateShader(const Xenos::BuiltShader& b) {
 // Tiny 3x5 font for the performance overlay, drawn into the uploaded image.
 // Lines are separated by '\n'.
 void DrawOverlay(uint32_t* pixels, int pitch_px, int w, int h, const char* text) {
-  static const char kChars[] = "0123456789.% FPSDCGAVX";
+  static const char kChars[] = "0123456789.% FPSDCGAVXBE";
   static const uint16_t kGlyphs[] = {0x7B6F, 0x2C97, 0x73E7, 0x73CF, 0x5BC9, 0x79CF, 0x79EF, 0x7249, 0x7BEF,
                                      0x7BCF, 0x0002, 0x52A5, 0x0000, 0x79E4, 0x7BE4, 0x79CF, 0x6B6E, 0x7927,
-                                     0x796F, 0x2BED, 0x5B6A, 0x5AAD};
+                                     0x796F, 0x2BED, 0x5B6A, 0x5AAD, 0x6BAE, 0x79E7};
   const int scale = 2, ox = 4, oy = 3;
   for (int y = 0; y < h; y++)
     for (int x = 0; x < w; x++) pixels[y * pitch_px + x] = 0xFF000000;
@@ -111,7 +111,7 @@ bool Init() {
 namespace {
 
 XenosSurface* s_overlay_tex = nullptr;
-char s_overlay_text[64] = "";
+char s_overlay_text[96] = "";
 bool s_overlay_dirty = true;
 
 // Draws `tex` (texture coordinates u0..u1, v0..v1) fitted to the screen with a
@@ -126,9 +126,9 @@ void DrawPicture(XenosSurface* tex, float u0, float v0, float u1, float v1) {
     dh = sw * 3.0f / 4.0f;
   }
   float x0 = -dw / sw, x1 = dw / sw, y0 = dh / sh, y1 = -dh / sh;
-  // overlay quad in the top left corner (160 x 32 texels shown 1:1)
+  // overlay quad in the top left corner (160 x 48 texels shown 1:1)
   float ox0 = x0 + 16.0f / sw * 2, oy0 = y0 - 16.0f / sh * 2;
-  float ox1 = ox0 + 160.0f / sw * 2, oy1 = oy0 - 32.0f / sh * 2;
+  float ox1 = ox0 + 160.0f / sw * 2, oy1 = oy0 - 48.0f / sh * 2;
   const float quad[12][6] = {
       {x0, y0, 0, 1, u0, v0}, {x1, y0, 0, 1, u1, v0}, {x0, y1, 0, 1, u0, v1},
       {x1, y0, 0, 1, u1, v0}, {x1, y1, 0, 1, u1, v1}, {x0, y1, 0, 1, u0, v1},
@@ -150,15 +150,15 @@ void DrawPicture(XenosSurface* tex, float u0, float v0, float u1, float v1) {
   Xe_DrawPrimitive(s_xe, XE_PRIMTYPE_TRIANGLELIST, 0, 2);
   if (s_overlay_text[0]) {
     if (!s_overlay_tex) {
-      s_overlay_tex = Xe_CreateTexture(s_xe, 160, 32, 1, XE_FMT_8888 | XE_FMT_ARGB, 0);
+      s_overlay_tex = Xe_CreateTexture(s_xe, 160, 48, 1, XE_FMT_8888 | XE_FMT_ARGB, 0);
       s_overlay_tex->use_filtering = 0;
       s_overlay_tex->u_addressing = XE_TEXADDR_CLAMP;
       s_overlay_tex->v_addressing = XE_TEXADDR_CLAMP;
     }
     if (s_overlay_dirty) {
       uint8_t* d = (uint8_t*)Xe_Surface_LockRect(s_xe, s_overlay_tex, 0, 0, 0, 0, XE_LOCK_WRITE);
-      for (int y = 0; y < 32; y++) memset(d + y * s_overlay_tex->wpitch, 0, 160 * 4);
-      DrawOverlay((uint32_t*)d, s_overlay_tex->wpitch / 4, 160, 32, s_overlay_text);
+      for (int y = 0; y < 48; y++) memset(d + y * s_overlay_tex->wpitch, 0, 160 * 4);
+      DrawOverlay((uint32_t*)d, s_overlay_tex->wpitch / 4, 160, 48, s_overlay_text);
       Xe_Surface_Unlock(s_xe, s_overlay_tex);
       s_overlay_dirty = false;
     }
