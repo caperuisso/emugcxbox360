@@ -368,6 +368,121 @@ bool EmitInline(PPCEmitter& e, u32 inst) {
 
 bool s_inline_enabled = true;
 
+// The interpreter's FP expressions such as A * C + B are contracted into
+// fused multiply-adds by the compiler unless built with -ffp-contract=off
+// (the bit-exact qemu test build defines EMUGC_NO_FMA): emit the same.
+#ifdef EMUGC_NO_FMA
+constexpr bool kFused = false;
+#else
+constexpr bool kFused = true;
+#endif
+
+enum FpKind { FK_ADD, FK_SUB, FK_MUL, FK_DIV, FK_MADD, FK_MSUB, FK_NMADD, FK_NMSUB };
+struct FpTerm {
+  FpKind kind;
+  int a, b, c;  // operand halves (0 = ps0, 1 = ps1), -1 = unused
+};
+struct FpOp {
+  int dest;      // 0: ps0 only (double), 1: fill both (single), 2: pair
+  bool round;    // round to single
+  FpTerm t0, t1; // terms for ps0 and ps1 (t1 used when dest == 2)
+};
+
+bool DecodeFpOp(u32 inst, FpOp& f) {
+  u32 op = inst >> 26, xo5 = (inst >> 1) & 31;
+  auto kind_of = [](u32 x, FpKind& k) {
+    switch (x) {
+      case 21: k = FK_ADD; return true;
+      case 20: k = FK_SUB; return true;
+      case 25: k = FK_MUL; return true;
+      case 18: k = FK_DIV; return true;
+      case 29: k = FK_MADD; return true;
+      case 28: k = FK_MSUB; return true;
+      case 31: k = FK_NMADD; return true;
+      case 30: k = FK_NMSUB; return true;
+      default: return false;
+    }
+  };
+  FpKind k;
+  if (op == 63 && kind_of(xo5, k)) {  // double precision
+    f = {0, false, {k, 0, 0, 0}, {k, 0, 0, 0}};
+    return true;
+  }
+  if (op == 59 && kind_of(xo5, k)) {  // single precision
+    f = {1, true, {k, 0, 0, 0}, {k, 0, 0, 0}};
+    return true;
+  }
+  if (op == 4) {
+    if (kind_of(xo5, k)) {  // ps_add .. ps_nmsub
+      f = {2, true, {k, 0, 0, 0}, {k, 1, 1, 1}};
+      return true;
+    }
+    switch (xo5) {
+      case 12: f = {2, true, {FK_MUL, 0, -1, 0}, {FK_MUL, 1, -1, 0}}; return true;      // ps_muls0
+      case 13: f = {2, true, {FK_MUL, 0, -1, 1}, {FK_MUL, 1, -1, 1}}; return true;      // ps_muls1
+      case 14: f = {2, true, {FK_MADD, 0, 0, 0}, {FK_MADD, 1, 1, 0}}; return true;      // ps_madds0
+      case 15: f = {2, true, {FK_MADD, 0, 0, 1}, {FK_MADD, 1, 1, 1}}; return true;      // ps_madds1
+      default: return false;
+    }
+  }
+  return false;
+}
+
+// f1 = A, f2 = B, f3 = C (as needed) -> f0 = result
+void EmitFpTerm(PPCEmitter& e, u32 inst, const FpTerm& t, bool round) {
+  u32 ra = Field(inst, 16), rb = Field(inst, 11), rc = Field(inst, 6);
+  auto fpr = [](u32 r, int half) { return OFF_FPR + (s32)r * 16 + half * 8; };
+  bool uses_c = t.kind == FK_MUL || t.kind >= FK_MADD;
+  bool uses_b = t.kind != FK_MUL;
+  e.lfd(1, fpr(ra, t.a), R_CPU);
+  if (uses_b) e.lfd(2, fpr(rb, t.b), R_CPU);
+  if (uses_c) e.lfd(3, fpr(rc, t.c), R_CPU);
+  auto A = [&](u32 xo, u32 frt, u32 fra, u32 frb, u32 frc) { e.Emit(PPCEmitter::A(63, frt, fra, frb, frc, xo)); };
+  switch (t.kind) {
+    case FK_ADD: A(21, 0, 1, 2, 0); break;
+    case FK_SUB: A(20, 0, 1, 2, 0); break;
+    case FK_MUL: A(25, 0, 1, 0, 3); break;
+    case FK_DIV: A(18, 0, 1, 2, 0); break;
+    default:
+      if (kFused) {
+        u32 xo = t.kind == FK_MADD ? 29 : t.kind == FK_MSUB ? 28 : t.kind == FK_NMADD ? 31 : 30;
+        A(xo, 0, 1, 2, 3);
+      } else {
+        A(25, 0, 1, 0, 3);  // f0 = a * c
+        if (t.kind == FK_MADD || t.kind == FK_NMADD)
+          A(21, 0, 0, 2, 0);  // + b
+        else
+          A(20, 0, 0, 2, 0);  // - b
+        if (t.kind == FK_NMADD || t.kind == FK_NMSUB) e.Emit(PPCEmitter::X(63, 0, 0, 0, 40));  // fneg
+      }
+      break;
+  }
+  if (round) e.Emit(PPCEmitter::X(63, 0, 0, 0, 12));  // frsp
+}
+
+bool EmitFpFast(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
+  FpOp f;
+  if ((inst & 1) || !DecodeFpOp(inst, f)) return false;  // Rc forms are left to the interpreter
+  u32 rd = Field(inst, 21);
+  s32 dst = OFF_FPR + (s32)rd * 16;
+  e.lwz(0, OFF_MSR, R_CPU);
+  e.andi_(0, 0, MSR_FP);
+  slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+  if (f.dest == 2) {
+    // both halves read the sources before writing (rd may be a source)
+    EmitFpTerm(e, inst, f.t0, f.round);
+    e.Emit(PPCEmitter::X(63, 4, 0, 0, 72));  // fmr f4, f0
+    EmitFpTerm(e, inst, f.t1, f.round);
+    e.stfd(4, dst, R_CPU);
+    e.stfd(0, dst + 8, R_CPU);
+  } else {
+    EmitFpTerm(e, inst, f.t0, f.round);
+    e.stfd(0, dst, R_CPU);
+    if (f.dest == 1) e.stfd(0, dst + 8, R_CPU);
+  }
+  return true;
+}
+
 // Branches (always the last instruction of a block). On return r28 holds the
 // next pc. The forms that the interpreter uses for idle-loop detection
 // ("b ." and bc -8) are left to the interpreter.
@@ -650,9 +765,17 @@ BlockFn Compile(const u32* insts, const Interpreter::OpFn* fns, u32 count) {
   for (u32 k = 0; k < count; k++) {
     MemOp m;
     u32 ra = Field(insts[k], 16), rd = Field(insts[k], 21);
-    if (s_inline_enabled && DecodeMemOp(insts[k], m) && !(m.update && (ra == 0 || (!m.store && ra == rd)))) {
-      std::vector<u32> slow;
-      EmitMemFast(e, insts[k], m, slow);
+    std::vector<u32> slow;
+    bool fast = false;
+    if (s_inline_enabled) {
+      if (DecodeMemOp(insts[k], m) && !(m.update && (ra == 0 || (!m.store && !m.fp && ra == rd)))) {
+        EmitMemFast(e, insts[k], m, slow);
+        fast = true;
+      } else if (EmitFpFast(e, insts[k], slow)) {
+        fast = true;
+      }
+    }
+    if (fast) {
       // fast path done: inline bookkeeping
       e.addi(R_PC, R_PC, 4);
       e.addi(R_PENDING, R_PENDING, 1);
