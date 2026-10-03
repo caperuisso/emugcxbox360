@@ -34,6 +34,7 @@ struct RenderState {
 struct ShaderEntry {
   Xenos::BuiltShader shader;
   void* backend_object = nullptr;  // owned by the backend (GPU copy of the code)
+  u32 const_count = 0;             // pixel shader constants actually used (from c0)
 };
 
 constexpr int NUM_PS_CONSTS = 96;

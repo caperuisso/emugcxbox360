@@ -137,19 +137,33 @@ void Decode(const Video::GpuDrawState& st, DrawInfo& d) {
 }
 
 // ---- Shader caches ----
-std::unordered_map<std::string, std::unique_ptr<ShaderEntry>>* s_ps_cache = nullptr;
-std::unordered_map<std::string, std::unique_ptr<ShaderEntry>>* s_vs_cache = nullptr;
+// Pixel shaders: hashed key -> entries (full key compared on lookup), plus a
+// one-entry memo of the previous draw. Vertex shaders: [texgens][fog].
+struct PsKey {
+  u32 n = 0;
+  u32 w[3 + 4 + 16 * 4];
+  bool operator==(const PsKey& o) const { return n == o.n && memcmp(w, o.w, n * 4) == 0; }
+};
+struct PsEntry {
+  PsKey key;
+  std::unique_ptr<ShaderEntry> shader;
+};
+std::unordered_map<u64, std::vector<PsEntry>>* s_ps_cache = nullptr;
+PsKey s_last_ps_key;
+ShaderEntry* s_last_ps = nullptr;
+u32 s_ps_count = 0;
+ShaderEntry* s_vs_table[9][2] = {};
 
-std::string KeyOf(const std::vector<u32>& words) {
-  return std::string((const char*)words.data(), words.size() * 4);
+u64 HashKey(const PsKey& k) {
+  u64 h = 1469598103934665603ull;
+  for (u32 i = 0; i < k.n; i++) h = (h ^ k.w[i]) * 1099511628211ull;
+  return h;
 }
 
 // ---- Vertex shader: passes position, 2 colors, texcoords and fog depth ----
 ShaderEntry* GetVertexShader(u32 texgens, bool fog) {
-  if (!s_vs_cache) s_vs_cache = new std::unordered_map<std::string, std::unique_ptr<ShaderEntry>>();
-  std::string key = KeyOf({texgens, fog ? 1u : 0u});
-  auto it = s_vs_cache->find(key);
-  if (it != s_vs_cache->end()) return it->second.get();
+  if (texgens > 8) texgens = 8;
+  if (ShaderEntry* cached = s_vs_table[texgens][fog ? 1 : 0]) return cached;
 
   u32 stride = 12 + texgens * 3 + (fog ? 2 : 0);
   ShaderBuilder b(false);
@@ -165,10 +179,9 @@ ShaderEntry* GetVertexShader(u32 texgens, bool fog) {
   b.BeginPhase(PHASE_INTERP);
   u32 interps = 2 + texgens + (fog ? 1 : 0);
   for (u32 i = 0; i < interps; i++) b.MovExport(i, 0xF, Src::R(2 + i));
-  auto e = std::make_unique<ShaderEntry>();
-  e->shader = {b.Build(), VertexProgramControl(b.TempCount(), interps), 0};
-  ShaderEntry* p = e.get();
-  (*s_vs_cache)[key] = std::move(e);
+  ShaderEntry* p = new ShaderEntry();
+  p->shader = {b.Build(), VertexProgramControl(b.TempCount(), interps), 0};
+  s_vs_table[texgens][fog ? 1 : 0] = p;
   return p;
 }
 
@@ -291,25 +304,31 @@ int AlphaTestFold(u32 cmp) {
 }
 
 ShaderEntry* GetPixelShader(const DrawInfo& d) {
-  if (!s_ps_cache) s_ps_cache = new std::unordered_map<std::string, std::unique_ptr<ShaderEntry>>();
-  std::vector<u32> keyw;
-  keyw.push_back(d.num_stages | (d.num_texgens << 8) | (d.num_chans << 12) | (d.fog_sel << 16) |
-                 ((d.fog_ortho ? 1u : 0u) << 20));
-  keyw.push_back(d.alpha_cmp);
-  keyw.push_back(d.num_ind);
-  for (u32 i = 0; i < d.num_ind; i++) keyw.push_back(d.ind_map[i] | (d.ind_coord[i] << 3));
+  if (!s_ps_cache) s_ps_cache = new std::unordered_map<u64, std::vector<PsEntry>>();
+  PsKey key;
+  auto push = [&](u32 v) { key.w[key.n++] = v; };
+  push(d.num_stages | (d.num_texgens << 8) | (d.num_chans << 12) | (d.fog_sel << 16) | ((d.fog_ortho ? 1u : 0u) << 20));
+  push(d.alpha_cmp);
+  push(d.num_ind);
+  for (u32 i = 0; i < d.num_ind; i++) push(d.ind_map[i] | (d.ind_coord[i] << 3));
   for (u32 s = 0; s < d.num_stages; s++) {
     const StageInfo& c = d.stage[s];
-    keyw.push_back(c.cc);
-    keyw.push_back(c.ac);
-    keyw.push_back(c.texmap | (c.texcoord << 3) | ((c.tex_enable ? 1u : 0u) << 6) | (c.ras_chan << 7) |
-                   (c.tex_swap[0] << 10) | (c.tex_swap[1] << 12) | (c.tex_swap[2] << 14) | (c.tex_swap[3] << 16) |
-                   (c.ras_swap[0] << 18) | (c.ras_swap[1] << 20) | (c.ras_swap[2] << 22) | (c.ras_swap[3] << 24));
-    keyw.push_back(d.ind_cmd[s] & ~(0x7u << 4));  // the bias selection is a constant
+    push(c.cc);
+    push(c.ac);
+    push(c.texmap | (c.texcoord << 3) | ((c.tex_enable ? 1u : 0u) << 6) | (c.ras_chan << 7) | (c.tex_swap[0] << 10) |
+         (c.tex_swap[1] << 12) | (c.tex_swap[2] << 14) | (c.tex_swap[3] << 16) | (c.ras_swap[0] << 18) |
+         (c.ras_swap[1] << 20) | (c.ras_swap[2] << 22) | (c.ras_swap[3] << 24));
+    push(d.ind_cmd[s] & ~(0x7u << 4));  // the bias selection is a constant
   }
-  std::string key = KeyOf(keyw);
-  auto it = s_ps_cache->find(key);
-  if (it != s_ps_cache->end()) return it->second.get();
+  if (s_last_ps && key == s_last_ps_key) return s_last_ps;
+  u64 hash = HashKey(key);
+  std::vector<PsEntry>& bucket = (*s_ps_cache)[hash];
+  for (PsEntry& pe : bucket)
+    if (pe.key == key) {
+      s_last_ps_key = key;
+      s_last_ps = pe.shader.get();
+      return s_last_ps;
+    }
 
   PsRegs r;
   r.interps = 2 + d.num_texgens + (d.fog ? 1 : 0);
@@ -529,8 +548,14 @@ ShaderEntry* GetPixelShader(const DrawInfo& d) {
 
   auto e = std::make_unique<ShaderEntry>();
   e->shader = {b.Build(), PixelProgramControl(b.TempCount()), 4};
+  bool indirect = d.num_ind > 0;
+  for (u32 s = 0; s < d.num_stages; s++) indirect |= d.ind_cmd[s] != 0;
+  e->const_count = indirect ? NUM_PS_CONSTS : C_IND_SCALE;
   ShaderEntry* p = e.get();
-  (*s_ps_cache)[key] = std::move(e);
+  bucket.push_back({key, std::move(e)});
+  s_ps_count++;
+  s_last_ps_key = key;
+  s_last_ps = p;
   return p;
 }
 
@@ -744,6 +769,6 @@ void PrepareClear(int x0, int y0, int x1, int y1, bool color, bool alpha, bool d
   }
 }
 
-u32 ShaderCount() { return (s_ps_cache ? (u32)s_ps_cache->size() : 0) + (s_vs_cache ? (u32)s_vs_cache->size() : 0); }
+u32 ShaderCount() { return s_ps_count; }
 
 }  // namespace XenosGx

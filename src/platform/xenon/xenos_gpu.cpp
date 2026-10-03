@@ -413,7 +413,13 @@ class XenosBackend : public Video::GpuBackend {
     Xe_SetScissor(s_xe, 1, rs.sc_left, rs.sc_top, rs.sc_right, rs.sc_bottom);
     Xe_SetShader(s_xe, SHADER_TYPE_PIXEL, ShaderObject(pd.ps), 0);
     Xe_SetShader(s_xe, SHADER_TYPE_VERTEX, ShaderObject(pd.vs), 0);
-    Xe_SetPixelShaderConstantF(s_xe, 0, &pd.ps_consts[0][0], XenosGx::NUM_PS_CONSTS);
+    // constants: only the used range, and only when they changed
+    u32 nconst = pd.ps->const_count ? pd.ps->const_count : XenosGx::NUM_PS_CONSTS;
+    if (nconst > m_consts_valid || memcmp(m_consts, pd.ps_consts, nconst * 16) != 0) {
+      Xe_SetPixelShaderConstantF(s_xe, 0, &pd.ps_consts[0][0], nconst);
+      memcpy(m_consts, pd.ps_consts, nconst * 16);
+      m_consts_valid = nconst;
+    }
     for (u32 t = 0; t < 8; t++) {
       if (!(pd.tex_mask & (1u << t)) || !tex || !tex[t].rgba) continue;
       XenosSurface* surf = Texture(tex[t]);
@@ -443,6 +449,8 @@ class XenosBackend : public Video::GpuBackend {
   XfbCopy* m_xfb_shown = nullptr;
   bool m_xfb_new = false;
   XenosGx::PreparedDraw m_pd;
+  float m_consts[XenosGx::NUM_PS_CONSTS][4];
+  u32 m_consts_valid = 0;  // leading constants known to be uploaded
   XenosSurface* m_efb_rt = nullptr;
   XenosSurface* m_efb_copy = nullptr;
   XenosSurface* m_depth_copy = nullptr;
