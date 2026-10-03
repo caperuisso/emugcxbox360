@@ -32,7 +32,9 @@ enum Reg : u32 {
 
 u16 s_regs[0x40];
 bool s_di_status[4];
-u32 s_line;  // 1-based beam position within the frame
+u32 s_line;  // 1-based beam position within the frame, at the last line event
+u64 s_line_cycles;  // when the beam reached s_line
+u32 s_pending = 1;  // lines until the scheduled line event
 int s_line_event = -1;
 std::vector<u32> s_frame;
 
@@ -134,10 +136,54 @@ void FieldDone() {
   g_field_done = true;
 }
 
+// The line event only fires on lines where something happens (display
+// interrupt lines, field starts); the beam position in between is derived
+// from the time.
+bool TwoFields() { return !IsNonInterlaced() && !IsProgressive(); }
+
+u32 LinesUntilEvent(u32 from) {
+  u32 lines = LinesPerCycle(), best = lines;
+  auto consider = [&](u32 target) {
+    if (target < 1 || target > lines) return;
+    u32 d = (target + lines - from) % lines;
+    if (d == 0) d = lines;
+    best = std::min(best, d);
+  };
+  for (int i = 0; i < 4; i++) consider(R(DI0_HI + i * 4) & 0x3FF);
+  consider(1);
+  if (TwoFields()) consider(lines / 2 + 1);
+  return best;
+}
+
+u32 CurrentLine(u64* line_start = nullptr) {
+  u32 lines = LinesPerCycle(), cpl = CyclesPerLine();
+  u64 now = CoreTiming::GetTicks();
+  u64 elapsed = now > s_line_cycles ? now - s_line_cycles : 0;
+  u64 adv = cpl ? elapsed / cpl : 0;
+  if (line_start) *line_start = s_line_cycles + adv * cpl;
+  return (u32)(((u64)(s_line - 1) + adv) % lines) + 1;
+}
+
+void ScheduleNext(s64 already) {
+  s_pending = LinesUntilEvent(s_line);
+  CoreTiming::ScheduleEvent(s_line_event, (s64)s_pending * CyclesPerLine() - already);
+}
+
+// Timing or interrupt lines changed: re-plan the next event from the beam's
+// current position.
+void Resync() {
+  if (s_line_event < 0) return;
+  u64 line_start;
+  s_line = CurrentLine(&line_start);
+  s_line_cycles = line_start;
+  CoreTiming::RemoveEvent(s_line_event);
+  ScheduleNext((s64)(CoreTiming::GetTicks() - line_start));
+}
+
 void LineCallback(u64, s64 late) {
   u32 lines = LinesPerCycle();
-  s_line++;
-  if (s_line > lines) s_line = 1;
+  s_line = (u32)(((u64)(s_line - 1) + s_pending) % lines) + 1;
+  s_line_cycles = CoreTiming::GetTicks() - (u64)late;
 
   bool changed = false;
   for (int i = 0; i < 4; i++) {
@@ -149,10 +195,10 @@ void LineCallback(u64, s64 late) {
   }
   if (changed) UpdateInterrupt();
 
-  bool two_fields = !IsNonInterlaced() && !IsProgressive();
+  bool two_fields = TwoFields();
   if (s_line == 1 || (two_fields && s_line == lines / 2 + 1)) FieldDone();
 
-  CoreTiming::ScheduleEvent(s_line_event, (s64)CyclesPerLine() - late);
+  ScheduleNext(late);
 }
 }  // namespace
 
@@ -160,7 +206,15 @@ void DoState(StateBuffer& s) {
   s.Marker("VI");
   s.Do(s_regs);
   s.Do(s_di_status);
-  s.Do(s_line);
+  // The line count until the next event shares the word with the line
+  // (states from before event skipping have 0 there: one line).
+  u32 packed = s_line | (s_pending << 16);
+  s.Do(packed);
+  if (s.IsReading()) {
+    s_line = packed & 0xFFFF;
+    s_pending = (packed >> 16) ? (packed >> 16) : 1;
+    s_line_cycles = CoreTiming::GetTicks();  // approximate until the next event
+  }
 }
 
 void Init() { s_line_event = CoreTiming::RegisterEvent("VI line", LineCallback); }
@@ -174,9 +228,10 @@ void Reset() {
   s_regs[DCR >> 1] = 0;
   s_regs[PICCONF >> 1] = (40 << 8) | 40;
   s_line = 1;
+  s_line_cycles = CoreTiming::GetTicks();
   g_field_done = false;
   CoreTiming::RemoveEvent(s_line_event);
-  CoreTiming::ScheduleEvent(s_line_event, CyclesPerLine());
+  ScheduleNext(0);
 }
 
 // Register state the IPL leaves behind (values from Dolphin's VideoInterface::Preset).
@@ -204,12 +259,13 @@ void SetBootTVMode(bool pal) {
   s_regs[PICCONF >> 1] = (40 << 8) | 40;
   memset(s_di_status, 0, sizeof(s_di_status));
   UpdateInterrupt();
+  Resync();
 }
 
 u16 Read16(u32 off) {
   if (off >= 0x80) return 0;
   switch (off) {
-    case DPV: return (u16)s_line;
+    case DPV: return (u16)CurrentLine();
     case DPH: return 1;
     case DI0_HI:
     case DI0_HI + 4:
@@ -231,12 +287,20 @@ void Write16(u32 off, u16 v) {
     case DI0_HI + 12: {
       int i = (off - DI0_HI) / 4;
       if (!(v & 0x8000)) s_di_status[i] = false;
+      bool vct_changed = ((s_regs[off >> 1] ^ v) & 0x3FF) != 0;
       s_regs[off >> 1] = v & 0x7FFF;
       UpdateInterrupt();
+      if (vct_changed) Resync();
       return;
     }
     case DPV:
     case DPH: return;
+    case VTR:
+    case DCR:
+    case VICLK:
+      s_regs[off >> 1] = v;
+      Resync();  // the line count or duration may have changed
+      return;
     default: s_regs[off >> 1] = v; return;
   }
 }
