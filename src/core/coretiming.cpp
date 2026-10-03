@@ -12,7 +12,7 @@ namespace CoreTiming {
 u64 g_slice_end = 0;
 
 namespace {
-constexpr s64 MAX_SLICE = 20000;
+constexpr s64 MAX_SLICE = 200000;
 
 struct EventType {
   const char* name;
