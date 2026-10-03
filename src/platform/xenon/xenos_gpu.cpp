@@ -383,7 +383,6 @@ class XenosBackend : public Video::GpuBackend {
       it->second.last_use = m_frame;
       return it->second.surf;
     }
-    if (m_textures.size() > 512) EvictTextures();
     XenosSurface* surf = Xe_CreateTexture(s_xe, t.width, t.height, 1, XE_FMT_8888 | XE_FMT_ARGB, 0);
     u8* dst = (u8*)Xe_Surface_LockRect(s_xe, surf, 0, 0, 0, 0, XE_LOCK_WRITE);
     for (int y = 0; y < t.height; y++) {
@@ -447,6 +446,8 @@ class XenosBackend : public Video::GpuBackend {
       memcpy(m_consts, pd.ps_consts, nconst * 16);
       m_consts_valid = nconst;
     }
+    // evict before binding: a draw must not lose a surface it already bound
+    if (m_textures.size() > 504) EvictTextures();
     for (u32 t = 0; t < 8; t++) {
       if (!(pd.tex_mask & (1u << t)) || !tex || !tex[t].rgba) continue;
       XenosSurface* surf = Texture(tex[t]);
