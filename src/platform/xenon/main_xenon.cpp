@@ -524,6 +524,29 @@ int main() {
     memset(&c, 0, sizeof(c));
     get_controller_data(&c, 0);
     if (c.logo) break;  // Guide button: back to XeLL
+    // Save states: Back + left stick click saves, Back + right stick click
+    // loads ("<game>.st" next to the game); a short rumble confirms.
+    {
+      static bool save_was = false, load_was = false;
+      static int rumble_frames = 0;
+      bool save = c.back && c.s1_z, load = c.back && c.s2_z;
+      std::string state_path = game + ".st";
+      if (save && !save_was) {
+        bool ok = System::SaveState(state_path);
+        printf("[state] save %s: %s\n", state_path.c_str(), ok ? "ok" : "FAILED");
+        if (ok) set_controller_rumble(0, 120, 120), rumble_frames = 12;
+      }
+      if (load && !load_was) {
+        bool ok = System::LoadState(state_path);
+        printf("[state] load %s: %s\n", state_path.c_str(), ok ? "ok" : "FAILED");
+        if (ok) set_controller_rumble(0, 60, 200), rumble_frames = 12;
+        pace_start = mftb();
+        pace_fields = 0;
+      }
+      save_was = save;
+      load_was = load;
+      if (rumble_frames && --rumble_frames == 0) set_controller_rumble(0, 0, 0);
+    }
   }
   System::Shutdown();
   return 0;
