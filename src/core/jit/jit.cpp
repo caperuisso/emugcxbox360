@@ -460,6 +460,112 @@ void EmitFpTerm(PPCEmitter& e, u32 inst, const FpTerm& t, bool round) {
   if (round) e.Emit(PPCEmitter::X(63, 0, 0, 0, 12));  // frsp
 }
 
+// Quantized paired-single loads/stores with a float GQR type (the common
+// case): two singles (or one and 1.0) straight from/to guest RAM.
+bool EmitPsqFast(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
+  u32 op = inst >> 26;
+  bool indexed = false, store, update;
+  u32 w, qr;
+  if (op == 56 || op == 57 || op == 60 || op == 61) {
+    store = op >= 60;
+    update = op & 1;
+    w = (inst >> 15) & 1;
+    qr = (inst >> 12) & 7;
+  } else if (op == 4) {
+    u32 xo = (inst >> 1) & 0x3F;
+    if (xo != 6 && xo != 7 && xo != 38 && xo != 39) return false;
+    indexed = true;
+    store = xo & 1;
+    update = xo >= 38;
+    w = (inst >> 10) & 1;
+    qr = (inst >> 7) & 7;
+  } else {
+    return false;
+  }
+  u32 rd = Field(inst, 21), ra = Field(inst, 16), rb = Field(inst, 11);
+  if (update && ra == 0) return false;
+  // ea -> r3
+  if (indexed) {
+    LoadGpr(e, 4, rb);
+    if (ra) {
+      LoadGpr(e, 3, ra);
+      e.add(3, 3, 4);
+    } else {
+      e.mr(3, 4);
+    }
+  } else {
+    s32 d = ((s32)(inst << 20)) >> 20;
+    if (ra) {
+      LoadGpr(e, 3, ra);
+      e.addi(3, 3, d);
+    } else {
+      e.li(3, d);
+    }
+  }
+  // MSR.DR and MSR.FP, float GQR type, 4-byte alignment
+  e.lwz(0, OFF_MSR, R_CPU);
+  e.andi_(0, 0, MSR_DR | MSR_FP);
+  e.cmplwi(0, 0, MSR_DR | MSR_FP);
+  slow.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_EQ));
+  e.lwz(8, OFF_SPR + (s32)(SPR_GQR0 + qr) * 4, R_CPU);
+  e.rlwinm(9, 8, store ? 0 : 16, 29, 31);  // type
+  e.cmplwi(0, 9, 4);
+  slow.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_LT));
+  e.andi_(0, 3, 3);
+  slow.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_EQ));
+  // both elements in the same 128 KiB BAT block: (ea & 0x1FFFF) <= 0x1FFF8
+  e.rlwinm(0, 3, 0, 15, 31);
+  e.LoadImm(10, 0x1FFF8);
+  e.cmplw(0, 0, 10);
+  slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_GT));
+  // translation
+  e.rlwinm(4, 3, 15, 15, 29);
+  e.lwzx(5, R_DBAT, 4);
+  e.cmpwi(0, 5, 0);
+  slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+  e.rlwimi(5, 3, 0, 15, 31);
+  e.addi(7, 5, 8);
+  e.rlwinm(7, 7, 9, 23, 31);  // (pa + 8) >> 23 < 3: both elements in MEM1
+  e.cmplwi(0, 7, 3);
+  slow.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_LT));
+  s32 fpr = OFF_FPR + (s32)rd * 16;
+  if (!store) {
+    e.lfsx(0, R_MEM1, 5);
+    if (w) {
+      e.LoadImm(6, 0x3FF00000);  // 1.0
+      e.li(7, 0);
+      e.stw(6, fpr + 8, R_CPU);
+      e.stw(7, fpr + 12, R_CPU);
+    } else {
+      e.addi(6, 5, 4);
+      e.lfsx(1, R_MEM1, 6);
+      e.stfd(1, fpr + 8, R_CPU);
+    }
+    e.stfd(0, fpr, R_CPU);
+  } else {
+    e.lfd(0, fpr, R_CPU);
+    e.Emit(PPCEmitter::X(63, 0, 0, 0, 12));  // frsp
+    e.stfsx(0, R_MEM1, 5);
+    if (!w) {
+      e.lfd(1, fpr + 8, R_CPU);
+      e.Emit(PPCEmitter::X(63, 1, 0, 1, 12));  // frsp f1, f1
+      e.addi(6, 5, 4);
+      e.stfsx(1, R_MEM1, 6);
+    }
+    e.LoadImm(8, Addr(&Mem::g_write_stamp));
+    e.lwz(8, 0, 8);
+    e.rlwinm(9, 5, 22, 10, 29);
+    e.stwx(8, R_STAMP, 9);
+    if (!w) {
+      e.addi(6, 5, 4);
+      e.rlwinm(9, 6, 22, 10, 29);
+      e.stwx(8, R_STAMP, 9);
+    }
+  }
+  if (update) StoreGpr(e, 3, ra);
+  return true;
+}
+
 bool EmitFpFast(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
   FpOp f;
   if ((inst & 1) || !DecodeFpOp(inst, f)) return false;  // Rc forms are left to the interpreter
@@ -772,6 +878,8 @@ BlockFn Compile(const u32* insts, const Interpreter::OpFn* fns, u32 count) {
         EmitMemFast(e, insts[k], m, slow);
         fast = true;
       } else if (EmitFpFast(e, insts[k], slow)) {
+        fast = true;
+      } else if (EmitPsqFast(e, insts[k], slow)) {
         fast = true;
       }
     }
