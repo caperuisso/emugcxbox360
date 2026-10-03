@@ -138,9 +138,15 @@ void Run() {
     u32 id = s_map[pa >> 2];
     const Block* b = id ? &s_blocks[id - 1] : Compile(pa);
     if (!id) id = (u32)s_blocks.size();
+    // Generated code runs whole blocks only (same budget as Jit's: instructions
+    // left in the slice); a block the slice ends inside is interpreted.
     if (Jit::HasBlock(id)) {
-      Jit::Run(id);
-      continue;
+      u64 left = CoreTiming::g_slice_end - cpu.cycles;
+      u64 budget = left >= 0x80000000ull ? 0x7FFFFFFFull : (left + cpi - 1) / cpi;
+      if (budget >= b->count) {
+        Jit::Run(id);
+        continue;
+      }
     }
     const Decoded* code = &s_code[b->first];
     for (u32 k = 0; k < b->count; k++) {

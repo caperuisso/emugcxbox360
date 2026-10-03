@@ -14,6 +14,8 @@ the PC (reference images, qemu-ppc big-endian runs) before going to the console.
 - [x] Real Xenos backend (libxenon Xe): EFB in EDRAM, texture cache, vertex ring, read-back of
       color and depth (rectangles only), restore after presents — untested on hardware
 - [x] XFB copies presented straight from the GPU (no YUV round trip)
+- [x] Consecutive draws with identical state merged (~1570 -> ~110 backend draws per field)
+- [x] Texture bindings and vertex formats remembered between primitives
 - [ ] Mipmaps / LOD bias on the GPU path (level 0 only for now)
 - [ ] EFB copies to textures kept on the GPU (avoid the read-back)
 - [ ] Vertex transform on the GPU (currently CPU, cheap so far)
@@ -28,6 +30,9 @@ the PC (reference images, qemu-ppc big-endian runs) before going to the console.
 - [x] v16: fixed the BAT index in the memory fast path and the dispatcher (rotate by 17, not 15):
       every load/store and every unlinked block exit used to fall back to C. Interpreted
       instructions over 30 WW fields: 32M -> 2.0M (left: idle loops, mtmsr, mftb, MMIO)
+- [x] v17-v20: mfmsr inline; mfocrf instead of mfcr (microcoded on the Xenon); pc / cycle / budget
+      bookkeeping per block instead of per instruction (a block runs only when it fits in the
+      time slice, otherwise the C loop interprets it, as before)
 - [x] `EMUGC_JIT_PROF=1`: counts the instructions still interpreted (with the address region of
       memory slow paths), printed at exit
 - Each version verified bit-identical to the interpreter over 300-1500 WW fields under qemu-ppc.

@@ -481,7 +481,7 @@ void PlanCache(const u32* insts, u32 count) {
 
 // Copies host cr0 (LT GT EQ) plus the guest XER.SO into guest CR field `f`.
 void UpdateGuestCR(PPCEmitter& e, u32 f) {
-  e.mfcr(0);
+  e.mfocrf_cr0(0);
   e.rlwinm(7, 0, 4, 28, 30);  // LT GT EQ -> bits 3..1 of a nibble
   e.lwz(8, OFF_XER, R_CPU);
   e.rlwinm(8, 8, 1, 31, 31);  // SO -> bit 0
@@ -989,7 +989,7 @@ bool EmitFpCompare(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
   slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
   u32 fa = FprRead(e, 1, ra, 0), fb = FprRead(e, 2, rb, 0);
   e.Emit(PPCEmitter::X(63, 0, fa, fb, 0));  // fcmpu cr0, fa, fb
-  e.mfcr(0);
+  e.mfocrf_cr0(0);
   e.rlwinm(7, 0, 4, 28, 31);  // code in the low nibble
   LoadCR(e, 9);
   e.rlwimi(9, 7, (28 - 4 * crf) & 31, 4 * crf, 4 * crf + 3);
@@ -1400,7 +1400,6 @@ bool Compile(u32 id, u32 block_pa, const u32* insts, const Interpreter::OpFn* fn
     jump(target);
     e.PatchBranchTo(skip, e.Here());
   };
-  std::vector<u32> exhaust;  // budget exhausted after an inlined instruction -> exit
   struct LinkSite {
     u32 at;
     u32 target_pa;
@@ -1437,7 +1436,26 @@ bool Compile(u32 id, u32 block_pa, const u32* insts, const Interpreter::OpFn* fn
   }
   s_cr_cached = s_inline_enabled;
   s_cr_written = false;
-  CacheReload(e);  // block entry
+  // Block entry: the whole block must fit in the time slice, so that no
+  // instruction needs its own budget check (the C loop interprets blocks the
+  // slice ends inside, exactly like the interpreter). Memory holds the state.
+  e.cmpwi(0, R_BUDGET, (s32)count);
+  jump_unless(PPCEmitter::BO_FALSE, PPCEmitter::CR0_LT, s_exit);
+  CacheReload(e);
+  // pc, pending cycles and budget are brought up to date lazily: `unsynced`
+  // inlined instructions are not counted in them yet (r28 + 4 * unsynced is
+  // the current instruction).
+  u32 unsynced = 0;
+  auto sync_by = [&](u32 n) {
+    if (!n) return;
+    e.addi(R_PC, R_PC, (s32)(4 * n));
+    e.addi(R_PENDING, R_PENDING, (s32)n);
+    e.addi(R_BUDGET, R_BUDGET, -(s32)n);
+  };
+  auto sync = [&]() {
+    sync_by(unsynced);
+    unsynced = 0;
+  };
 
   bool ended = false;
   for (u32 k = 0; k < count && !ended; k++) {
@@ -1448,6 +1466,7 @@ bool Compile(u32 id, u32 block_pa, const u32* insts, const Interpreter::OpFn* fn
     bool fast = false;
     if (s_inline_enabled) {
       sx.inst_pa = block_pa + 4 * k;
+      if (last) sync();  // branches use r28 as their own address
       u32 before = e.Here();
       if (last && EmitBranch(e, insts[k])) {
         // static exits emitted their own tails; dynamic targets (bclr, bcctr,
@@ -1478,17 +1497,16 @@ bool Compile(u32 id, u32 block_pa, const u32* insts, const Interpreter::OpFn* fn
     }
     u32 to_next = 0;
     bool has_fast_path = fast;
+    u32 before_this = unsynced;  // not counting this instruction
     if (fast) {
-      e.addi(R_PC, R_PC, 4);
-      e.addi(R_PENDING, R_PENDING, 1);
-      e.Emit(PPCEmitter::D(13, R_BUDGET, R_BUDGET, -1));  // addic. r30, r30, -1
-      exhaust.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+      unsynced++;
       if (slow.empty()) continue;  // no fallback needed
       to_next = e.b_forward();
     }
     // Interpreted (or the slow path of a fast instruction)
     u32 slow_at = e.Here();
     for (u32 at : slow) e.PatchBranchTo(at, slow_at);
+    sync_by(before_this);
     CacheWriteBack(e);  // the handler works on the CPU state in memory
     call(s_flush);
     e.LoadImm(3, insts[k]);
@@ -1506,25 +1524,30 @@ bool Compile(u32 id, u32 block_pa, const u32* insts, const Interpreter::OpFn* fn
       ended = true;
     } else {
       jump_unless(PPCEmitter::BO_FALSE, PPCEmitter::CR0_LT, s_dispatch);  // lt: branch taken
+      // the handler may have moved the end of the slice (an event scheduled
+      // by a hardware register write): the rest of the block must still fit
+      e.cmpwi(0, R_BUDGET, (s32)(count - k - 1));
+      jump_unless(PPCEmitter::BO_FALSE, PPCEmitter::CR0_LT, s_exit);
       CacheReload(e);  // the handler may have changed any register
+      // r28 and the counters are now exact (past this instruction); the fast
+      // path joins below with `unsynced` instructions not counted: match it
+      if (has_fast_path) sync_by((u32)-(s32)unsynced);
     }
     if (has_fast_path) {
       e.PatchBranchTo(to_next, e.Here());
       if (last) {  // the fast path of the last instruction
+        sync();
         CacheWriteBack(e);
         jump(s_dispatch);
       }
+    } else {
+      unsynced = 0;
     }
   }
   if (!ended) {  // end of the block after an inlined instruction: falls into the next one
+    sync();
     CacheWriteBack(e);
     linkable_jump(block_pa + 4 * count);
-  }
-  if (!exhaust.empty()) {
-    u32 at = e.Here();
-    for (u32 x : exhaust) e.PatchBranchTo(x, at);
-    CacheWriteBack(e);  // every register written anywhere in the block (the others hold their memory value)
-    jump(s_exit);
   }
 
   s_static = nullptr;

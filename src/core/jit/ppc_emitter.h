@@ -84,6 +84,8 @@ class PPCEmitter {
 
   // ---- Special registers ----
   void mfcr(u32 rt) { Emit(X(31, rt, 0, 0, 19)); }
+  // mfocrf rt, cr0: only field 0 is defined (mfcr is microcoded on the Xenon)
+  void mfocrf_cr0(u32 rt) { Emit(X(31, rt, 0, 0, 19) | 0x00100000 | (0x80u << 12)); }
   void mtspr(u32 spr, u32 rs) { Emit((31u << 26) | (rs << 21) | ((spr & 0x1F) << 16) | ((spr >> 5) << 11) | (467 << 1)); }
   void mfspr(u32 rt, u32 spr) { Emit((31u << 26) | (rt << 21) | ((spr & 0x1F) << 16) | ((spr >> 5) << 11) | (339 << 1)); }
   void mtxer(u32 rs) { mtspr(1, rs); }
