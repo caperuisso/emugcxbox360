@@ -6,6 +6,7 @@
 #include "core/coretiming.h"
 #include "core/hw/hw.h"
 #include "core/memory.h"
+#include "core/prof.h"
 #include "core/video/gpu_backend.h"
 #include "core/state.h"
 #include "platform/platform.h"
@@ -66,6 +67,7 @@ inline u8 Clamp8(int v) { return v < 0 ? 0 : (v > 255 ? 255 : (u8)v); }
 
 void PresentXFB() {
   if (!g_host) return;
+  Prof::Scope prof(Prof::VI);
   u32 wpl = (R(PICCONF) >> 8) & 0x7F;  // width in 16-pixel units
   u32 std = R(PICCONF) & 0xFF;         // stride in 16-pixel units
   u32 acv = (R(VTR) >> 4) & 0x3FF;     // active lines per field

@@ -26,6 +26,7 @@ int bdev_enum(int handle, const char** name);
 
 #include "core/jit/jit.h"
 #include "core/memory.h"
+#include "core/prof.h"
 #include "platform/xenon/xenos_gpu.h"
 #include "core/system.h"
 
@@ -484,8 +485,22 @@ int main() {
       int fps10 = (int)(stats_fields * 10000u / ms);
       int speed = fps10 * 10 / field_rate;
       snprintf(host.overlay, sizeof(host.overlay), "FPS %d.%d SPD %d%%", fps10 / 10, fps10 % 10, speed);
-      if (host.gpu) XenosGpu::SetOverlay(host.overlay);
-      printf("[perf] %s\n", host.overlay);  // also on the UART
+      // Share of the time per component: C = emulated CPU, G = GX (GPU
+      // commands, EFB copies), A = audio DSP, V = video output
+      u64 t[Prof::NUM_CATS];
+      Prof::Take(t);
+      u64 total = 0;
+      for (u64 v : t) total += v;
+      if (!total) total = 1;
+      char prof[64];
+      snprintf(prof, sizeof(prof), "C%d G%d A%d V%d", (int)(t[Prof::CPU] * 100 / total),
+               (int)(t[Prof::GX] * 100 / total), (int)(t[Prof::DSP] * 100 / total), (int)(t[Prof::VI] * 100 / total));
+      printf("[perf] %s %s\n", host.overlay, prof);
+      if (host.gpu) {
+        char both[96];
+        snprintf(both, sizeof(both), "%s\n%s", host.overlay, prof);
+        XenosGpu::SetOverlay(both);
+      }
       stats_start = now;
       stats_fields = 0;
     }

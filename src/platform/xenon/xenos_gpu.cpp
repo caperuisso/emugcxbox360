@@ -61,24 +61,32 @@ XenosShader* CreateShader(const Xenos::BuiltShader& b) {
 }
 
 // Tiny 3x5 font for the performance overlay, drawn into the uploaded image.
+// Lines are separated by '\n'.
 void DrawOverlay(uint32_t* pixels, int pitch_px, int w, int h, const char* text) {
-  static const char kChars[] = "0123456789.% FPSD";
+  static const char kChars[] = "0123456789.% FPSDCGAV";
   static const uint16_t kGlyphs[] = {0x7B6F, 0x2C97, 0x73E7, 0x73CF, 0x5BC9, 0x79CF, 0x79EF, 0x7249, 0x7BEF,
-                                     0x7BCF, 0x0002, 0x52A5, 0x0000, 0x79E4, 0x7BE4, 0x79CF, 0x6B6E};
-  const int scale = 2, ox = 8, oy = 8;
-  int len = (int)strlen(text);
-  for (int y = oy - 2; y < oy + 5 * scale + 2 && y < h; y++)
-    for (int x = ox - 2; x < ox + len * 4 * scale + 2 && x < w; x++) pixels[y * pitch_px + x] = 0xFF000000;
-  for (int c = 0; c < len; c++) {
+                                     0x7BCF, 0x0002, 0x52A5, 0x0000, 0x79E4, 0x7BE4, 0x79CF, 0x6B6E, 0x7927,
+                                     0x796F, 0x2BED, 0x5B6A};
+  const int scale = 2, ox = 4, oy = 3;
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++) pixels[y * pitch_px + x] = 0xFF000000;
+  int line = 0, col0 = 0;
+  for (int c = 0; text[c]; c++) {
+    if (text[c] == '\n') {
+      line++;
+      col0 = c + 1;
+      continue;
+    }
     const char* pos = strchr(kChars, text[c]);
     if (!pos) continue;
     uint16_t g = kGlyphs[pos - kChars];
+    int cx = c - col0;
     for (int r = 0; r < 5; r++)
       for (int col = 0; col < 3; col++) {
         if (!(g & (1 << (14 - (r * 3 + col))))) continue;
         for (int dy = 0; dy < scale; dy++)
           for (int dx = 0; dx < scale; dx++) {
-            int x = ox + (c * 4 + col) * scale + dx, y = oy + r * scale + dy;
+            int x = ox + (cx * 4 + col) * scale + dx, y = oy + line * 6 * scale + r * scale + dy;
             if (x < w && y < h) pixels[y * pitch_px + x] = 0xFFFFFF00;
           }
       }
@@ -102,7 +110,7 @@ bool Init() {
 namespace {
 
 XenosSurface* s_overlay_tex = nullptr;
-char s_overlay_text[32] = "";
+char s_overlay_text[64] = "";
 bool s_overlay_dirty = true;
 
 // Draws `tex` (texture coordinates u0..u1, v0..v1) fitted to the screen with a
@@ -164,7 +172,7 @@ void DrawPicture(XenosSurface* tex, float u0, float v0, float u1, float v1) {
 }  // namespace
 
 void SetOverlay(const char* text) {
-  if (strncmp(text, s_overlay_text, sizeof(s_overlay_text)) == 0) return;
+  if (strncmp(text, s_overlay_text, sizeof(s_overlay_text) - 1) == 0) return;
   strncpy(s_overlay_text, text, sizeof(s_overlay_text) - 1);
   s_overlay_dirty = true;
 }

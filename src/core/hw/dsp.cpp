@@ -9,6 +9,7 @@
 #include "core/hw/dsp_hle.h"
 #include "core/hw/hw.h"
 #include "core/memory.h"
+#include "core/prof.h"
 #include "core/state.h"
 #include "platform/platform.h"
 
@@ -108,7 +109,10 @@ void DSPInterruptCallback(u64, s64) {
 }
 
 void HLEUpdateCallback(u64, s64 late) {
-  DSPHLE::Update();
+  {
+    Prof::Scope prof(Prof::DSP);
+    DSPHLE::Update();
+  }
   CoreTiming::ScheduleEvent(s_hle_event, HLE_UPDATE_CYCLES - late);
 }
 }  // namespace

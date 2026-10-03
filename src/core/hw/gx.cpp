@@ -5,6 +5,7 @@
 
 #include "core/hw/hw.h"
 #include "core/memory.h"
+#include "core/prof.h"
 #include "core/state.h"
 #include "core/video/video.h"
 
@@ -115,6 +116,7 @@ void DoState(StateBuffer& s) {
 }
 
 void ProcessFifo(const u8* data, u32 len) {
+  Prof::Scope prof(Prof::GX);
   s_pending.insert(s_pending.end(), data, data + len);
   u32 pos = 0;
   while (pos < s_pending.size()) {

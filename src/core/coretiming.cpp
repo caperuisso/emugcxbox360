@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "core/coretiming.h"
+#include "core/prof.h"
 
 #include <vector>
 
@@ -69,7 +70,10 @@ void Advance() {
   u64 target = cpu.cycles + MAX_SLICE;
   if (!s_events.empty() && s_events.front().time < target) target = s_events.front().time;
   g_slice_end = target;
-  CPU::Run();
+  {
+    Prof::Scope prof(Prof::CPU);
+    CPU::Run();
+  }
 
   while (!s_events.empty() && s_events.front().time <= cpu.cycles) {
     Event ev = s_events.front();
