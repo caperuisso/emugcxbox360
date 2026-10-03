@@ -87,6 +87,7 @@ constexpr s32 OFF_CYC = (s32)offsetof(CPUState, cycles);  // big-endian u64: hig
 constexpr s32 OFF_EXC = (s32)offsetof(CPUState, exceptions);
 constexpr s32 OFF_MSR = (s32)offsetof(CPUState, msr);
 constexpr s32 OFF_FPR = (s32)offsetof(CPUState, fpr);
+constexpr s32 OFF_FPSCR = (s32)offsetof(CPUState, fpscr);
 static_assert(OFF_SPR + 1024 * 4 < 32768, "CPU state offsets must fit a 16-bit displacement");
 
 inline s32 Gpr(u32 n) { return OFF_GPR + (s32)n * 4; }
@@ -409,6 +410,15 @@ bool EmitInline(PPCEmitter& e, u32 inst) {
           UpdateGuestCR(e, crf);
           return true;
         }
+        case 467: {  // mtspr LR / CTR
+          u32 spr = ((inst >> 16) & 31) | (((inst >> 11) & 31) << 5);
+          if (spr != SPR_LR && spr != SPR_CTR) return false;
+          LoadGpr(e, 3, rd);
+          e.stw(3, OFF_SPR + (s32)spr * 4, R_CPU);
+          return true;
+        }
+        case 54: case 86: case 246: case 278: case 470: case 310: case 438:  // cache hints: no-ops
+          return true;
         case 339: {  // mfspr LR / CTR
           u32 spr = ((inst >> 16) & 31) | (((inst >> 11) & 31) << 5);
           if (spr != SPR_LR && spr != SPR_CTR) return false;
@@ -682,8 +692,33 @@ bool EmitFpMove(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
   return true;
 }
 
+// fcmpu / fcmpo: the host comparison yields the same LT GT EQ UN code
+bool EmitFpCompare(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
+  u32 op = inst >> 26, xo = (inst >> 1) & 0x3FF;
+  if (op != 63 || (xo != 0 && xo != 32)) return false;
+  u32 crf = (inst >> 23) & 7, ra = Field(inst, 16), rb = Field(inst, 11);
+  e.lwz(0, OFF_MSR, R_CPU);
+  e.andi_(0, 0, MSR_FP);
+  slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+  e.lfd(1, OFF_FPR + (s32)ra * 16, R_CPU);
+  e.lfd(2, OFF_FPR + (s32)rb * 16, R_CPU);
+  e.Emit(PPCEmitter::X(63, 0, 1, 2, 0));  // fcmpu cr0, f1, f2
+  e.mfcr(0);
+  e.rlwinm(7, 0, 4, 28, 31);  // code in the low nibble
+  e.lwz(9, OFF_CR, R_CPU);
+  e.rlwimi(9, 7, (28 - 4 * crf) & 31, 4 * crf, 4 * crf + 3);
+  e.stw(9, OFF_CR, R_CPU);
+  // FPSCR: clear FPRF's C bit (0x10000), FPCC = code
+  e.lwz(9, OFF_FPSCR, R_CPU);
+  e.rlwinm(9, 9, 0, 16, 14);
+  e.rlwimi(9, 7, 12, 16, 19);
+  e.stw(9, OFF_FPSCR, R_CPU);
+  return true;
+}
+
 bool EmitFpFast(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
   if (EmitFpMove(e, inst, slow)) return true;
+  if (EmitFpCompare(e, inst, slow)) return true;
   FpOp f;
   if ((inst & 1) || !DecodeFpOp(inst, f)) return false;  // Rc forms are left to the interpreter
   u32 rd = Field(inst, 21);

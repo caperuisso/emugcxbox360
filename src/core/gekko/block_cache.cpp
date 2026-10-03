@@ -54,7 +54,11 @@ bool EndsBlock(u32 inst) {
     }
     case 31: {
       u32 ext = (inst >> 1) & 0x3FF;
-      return ext == 146 || ext == 467 || ext == 210 || ext == 242 || ext == 982;  // mtmsr, mtspr, mtsr, mtsrin, icbi
+      if (ext == 467) {  // mtspr: only BAT writes change address translation
+        u32 spr = ((inst >> 16) & 31) | (((inst >> 11) & 31) << 5);
+        return spr >= 528 && spr < 544;
+      }
+      return ext == 146 || ext == 210 || ext == 242 || ext == 982;  // mtmsr, mtsr, mtsrin, icbi
     }
     default:
       return false;
