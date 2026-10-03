@@ -14,4 +14,7 @@ bool Init();
 // aspect, by drawing it as a textured quad on the GPU.
 void Present(const uint32_t* argb, int width, int height, const char* overlay);
 
+// Renders GX draws on the GPU (Video::g_gpu). Requires Init().
+bool InstallBackend();
+
 }  // namespace XenosGpu

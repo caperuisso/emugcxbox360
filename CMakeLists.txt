@@ -8,7 +8,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Portable emulator core: shared by the SDL host build, the tests and the Xbox 360 build.
-file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS src/core/*.cpp)
+file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS src/core/*.cpp src/xenos/*.cpp)
 add_library(emucore STATIC ${CORE_SOURCES} third_party/zstd/zstddeclib.c)
 target_include_directories(emucore PUBLIC src third_party)
 target_compile_options(emucore PRIVATE -fno-strict-aliasing $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>)

@@ -7,11 +7,13 @@
 // that checks the big-endian code paths without the console.
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 #include "core/memory.h"
 #include "core/system.h"
 #include "platform/platform.h"
+#include "xenos/sim.h"
 
 namespace {
 
@@ -74,6 +76,8 @@ int main(int argc, char** argv) {
     return 1;
   }
   HeadlessHost host;
+  const char* gpu = getenv("EMUGC_GPU");
+  if (gpu && !strcmp(gpu, "sim")) XenosSim::Install();  // GPU path through the Xenos simulator
   int fields = atoi(argv[2]);
   if (!System::Init(&host) || !System::Boot(argv[1])) {
     printf("boot failed\n");

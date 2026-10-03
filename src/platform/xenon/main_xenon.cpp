@@ -340,6 +340,7 @@ void ScanDir(const std::string& dir, std::vector<std::string>& out) {
 // Simple file picker drawn with the libxenon text console.
 bool g_use_threads = false;
 bool g_use_gpu = true;
+bool g_gpu_render = true;  // GX rasterization on the GPU (needs the GPU display)
 
 std::string PickGame() {
   std::vector<std::string> games;
@@ -359,8 +360,9 @@ std::string PickGame() {
   for (;;) {
     if (sel != shown) {
       console_clrscr();
-      printf("emugcxbox360 - choose a game (A: start, X: multi-thread renderer %s, Y: GPU display %s, Guide: quit)\n\n",
-             g_use_threads ? "ON" : "OFF", g_use_gpu ? "ON" : "OFF");
+      printf("emugcxbox360 - choose a game\n");
+      printf("  A: start   X: multi-thread software renderer %s   Y: GPU display %s   B: GPU rendering %s   Guide: quit\n\n",
+             g_use_threads ? "ON" : "OFF", g_use_gpu ? "ON" : "OFF", g_gpu_render && g_use_gpu ? "ON" : "OFF");
       int first = std::max(0, sel - 10);
       for (int i = first; i < (int)games.size() && i < first + 20; i++)
         printf("%s %s\n", i == sel ? ">" : " ", games[i].c_str());
@@ -384,6 +386,12 @@ std::string PickGame() {
       shown = -1;
     }
     y_was_down = c.y;
+    static bool b_was_down = false;
+    if (c.b && !b_was_down) {
+      g_gpu_render = !g_gpu_render;
+      shown = -1;
+    }
+    b_was_down = c.b;
     bool down = c.down || c.s1_y < -20000, up = c.up || c.s1_y > 20000;
     if ((down || up) && repeat-- <= 0) {
       sel = std::clamp(sel + (down ? 1 : -1), 0, (int)games.size() - 1);
@@ -451,6 +459,7 @@ int main() {
   console_clrscr();  // black screen: no leftover text around the emulated picture
   console_close();   // the emulated picture owns the framebuffer from now on
   if (g_use_gpu) host.gpu = XenosGpu::Init();
+  if (host.gpu && g_gpu_render) XenosGpu::InstallBackend();
 
   u64 stats_start = mftb();
   int stats_fields = 0;

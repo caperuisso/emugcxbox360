@@ -15,7 +15,7 @@ LDSCRIPT := src/platform/xenon/app.lds
 
 TARGET   := emugcxbox360
 BUILD    := build-xenon
-SOURCES  := $(wildcard src/core/*.cpp src/core/*/*.cpp) src/platform/xenon/main_xenon.cpp src/platform/xenon/xenos_gpu.cpp
+SOURCES  := $(wildcard src/core/*.cpp src/core/*/*.cpp src/xenos/*.cpp) src/platform/xenon/main_xenon.cpp src/platform/xenon/xenos_gpu.cpp
 CSOURCES := third_party/zstd/zstddeclib.c
 OBJECTS  := $(patsubst %.cpp,$(BUILD)/%.o,$(SOURCES)) $(patsubst %.c,$(BUILD)/%.o,$(CSOURCES))
 DEPS     := $(OBJECTS:.o=.d)

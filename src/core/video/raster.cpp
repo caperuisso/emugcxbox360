@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "core/state.h"
+#include "core/video/gpu_backend.h"
 #include "core/video/video_internal.h"
 #include "platform/platform.h"
 
@@ -568,6 +569,8 @@ struct TriSetup {
 };
 
 std::vector<TriSetup> s_batch;  // triangles of the current draw call
+std::vector<GpuVertex> s_gpu_batch;  // same, for a hardware backend
+u32 s_tex_mask;
 u64 s_batch_area = 0;
 
 constexpr int SPAN = 8;  // perspective-correct texture coordinates every SPAN pixels
@@ -770,11 +773,37 @@ void BeginDraw() {
     if (s_stage[stage].tex_enable) tex_mask |= 1u << s_stage[stage].texmap;
   for (u32 st = 0; st < s_num_ind; st++) tex_mask |= 1u << Bits(s_iref, st * 6, 3);
   BindTextures(tex_mask);
+  s_tex_mask = tex_mask;
+  s_gpu_batch.clear();
   s_batch.clear();
   s_batch_area = 0;
 }
 
 void EndDraw() {
+  if (g_gpu) {
+    if (s_gpu_batch.empty()) return;
+    static GpuDrawState st;
+    memcpy(st.bp, g_bp, sizeof(st.bp));
+    for (int i = 0; i < 4; i++) {
+      const S16x4& r = g_tev_color_regs[i];
+      const S16x4& k = g_tev_konst_regs[i];
+      st.tev_regs[i][0] = r.r, st.tev_regs[i][1] = r.g, st.tev_regs[i][2] = r.b, st.tev_regs[i][3] = r.a;
+      st.tev_konst[i][0] = k.r, st.tev_konst[i][1] = k.g, st.tev_konst[i][2] = k.b, st.tev_konst[i][3] = k.a;
+    }
+    st.tex_mask = s_tex_mask;
+    for (u32 t = 0; t < 8; t++) {
+      if (s_tex_mask & (1u << t))
+        GetGpuTexture(t, st.tex[t]);
+      else
+        memset(&st.tex[t], 0, sizeof(st.tex[t]));
+    }
+    st.sc_left = s_sc_left, st.sc_top = s_sc_top, st.sc_right = s_sc_right, st.sc_bottom = s_sc_bottom;
+    g_stats.pixels += (u32)(s_gpu_batch.size() / 3);
+    g_gpu->Draw(st, s_gpu_batch.data(), (u32)s_gpu_batch.size());
+    MarkEFBGpuDirty();
+    s_gpu_batch.clear();
+    return;
+  }
   if (s_batch.empty()) return;
   // Small batches are not worth waking the workers.
   int workers = g_host ? g_host->ParallelWorkers() : 1;
@@ -795,6 +824,26 @@ void DrawTriangle(const OutputVertex* v0, const OutputVertex* v1, const OutputVe
   // Screen -> EFB coordinates
   float xs[3] = {v0->screen.x - 342.0f - s_x_off, v1->screen.x - 342.0f - s_x_off, v2->screen.x - 342.0f - s_x_off};
   float ys[3] = {v0->screen.y - 342.0f - s_y_off, v1->screen.y - 342.0f - s_y_off, v2->screen.y - 342.0f - s_y_off};
+
+  if (g_gpu) {
+    const OutputVertex* vs[3] = {v0, v1, v2};
+    for (int i = 0; i < 3; i++) {
+      GpuVertex g;
+      g.x = xs[i];
+      g.y = ys[i];
+      g.z = std::clamp(vs[i]->screen.z * (1.0f / 16777215.0f), 0.0f, 1.0f);
+      g.w = vs[i]->proj[3];
+      for (int c = 0; c < 2; c++)
+        for (int k = 0; k < 4; k++) g.color[c][k] = vs[i]->color[c][k] * (1.0f / 255.0f);
+      for (u32 n = 0; n < 8; n++) {
+        g.tex[n][0] = vs[i]->texcoords[n].x;
+        g.tex[n][1] = vs[i]->texcoords[n].y;
+        g.tex[n][2] = vs[i]->texcoords[n].z;
+      }
+      s_gpu_batch.push_back(g);
+    }
+    return;
+  }
 
   // 28.4 fixed point edge setup (hardware samples pixel centres)
   auto fx = [](float v) { return (s32)std::floor(v * 16.0f + 0.5f); };

@@ -8,6 +8,7 @@
 
 #include "core/memory.h"
 #include "core/state.h"
+#include "core/video/gpu_backend.h"
 #include "core/video/video_internal.h"
 
 namespace Video {
@@ -271,6 +272,7 @@ struct TexEntry {
   int levels;     // decoded levels
   bool valid;
   u32 last_use;
+  u32 version;    // unique per decode (GPU upload key)
   std::vector<u8> data;  // RGBA bytes, levels back to back
   u32 level_offset[MAX_LEVELS];
   int level_w[MAX_LEVELS], level_h[MAX_LEVELS];
@@ -286,6 +288,7 @@ std::vector<std::unique_ptr<TexEntry>>* s_cache = nullptr;
 size_t s_cache_bytes = 0;
 u32 s_tmem_gen = 1;
 u32 s_use_counter = 0;
+u32 s_version_counter = 0;
 BoundTexture s_bound[8];
 constexpr size_t CACHE_BUDGET = 24u << 20;
 
@@ -392,6 +395,7 @@ void BindTexture(u32 texmap) {
   e.levels = levels;
   e.valid = true;
   e.last_use = ++s_use_counter;
+  e.version = ++s_version_counter;
   size_t total = 0;
   for (int l = 0; l < levels; l++) {
     e.level_w[l] = (p.w1 >> l) + 1;
@@ -450,6 +454,21 @@ void InvalidateTextureCache() {
   s_cache_bytes = 0;
   s_tmem_gen++;
   for (BoundTexture& b : s_bound) b.e = nullptr;
+}
+
+void GetGpuTexture(u32 texmap, GpuTexture& out) {
+  const BoundTexture& b = s_bound[texmap];
+  const TexEntry* e = b.e;
+  memset(&out, 0, sizeof(out));
+  if (!e) return;
+  out.rgba = e->data.data() + e->level_offset[0];
+  out.width = e->level_w[0];
+  out.height = e->level_h[0];
+  out.id = e->version;
+  out.wrap_s = b.wrap_s;
+  out.wrap_t = b.wrap_t;
+  u32 mode0 = g_bp[TexReg(0x80, texmap)];
+  out.linear = Bits(mode0, 4, 1);  // magnification filter
 }
 
 void BindTextures(u32 mask) {

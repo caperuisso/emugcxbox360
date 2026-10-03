@@ -15,9 +15,19 @@ extern "C" {
 #include <xenos/xe_internal.h>
 }
 
+#include <memory>
+#include <unordered_map>
+#include <vector>
+
+#include "core/video/gpu_backend.h"
+#include "xenos/gx_draw.h"
 #include "xenos/shaders.h"
 
+extern "C" void Xe_pRBMayKick(struct XenosDevice* xe);
+
 namespace XenosGpu {
+
+void SaveEFBBeforePresent();  // GX backend: keeps the EFB while the EDRAM shows the frame
 
 namespace {
 
@@ -29,6 +39,7 @@ XenosShader* s_blit_ps = nullptr;
 XenosSurface* s_tex = nullptr;
 XenosVertexBuffer* s_vb = nullptr;
 int s_tex_w = 0, s_tex_h = 0;
+bool s_efb_active = false;  // the EDRAM currently holds the emulated EFB
 
 // Wraps run-time assembled microcode in libxenon's shader object (no XDK
 // container: an empty header without constants, the code already instantiated).
@@ -122,6 +133,8 @@ void Present(const uint32_t* argb, int width, int height, const char* overlay) {
   memcpy(v, quad, sizeof(quad));
   Xe_VB_Unlock(s_xe, s_vb);
 
+  if (s_efb_active) SaveEFBBeforePresent();
+  Xe_SetRenderTarget(s_xe, s_fb);
   Xe_InvalidateState(s_xe);
   Xe_SetClearColor(s_xe, 0xFF000000);
   Xe_SetZEnable(s_xe, 0);
@@ -133,6 +146,206 @@ void Present(const uint32_t* argb, int width, int height, const char* overlay) {
   Xe_DrawPrimitive(s_xe, XE_PRIMTYPE_TRIANGLELIST, 0, 2);
   Xe_Resolve(s_xe);
   Xe_Sync(s_xe);
+  s_efb_active = false;  // the EDRAM now holds the framebuffer
+}
+
+// ---- GX rendering backend ----
+namespace {
+
+constexpr int EFB_W = XenosGx::EFB_W, EFB_H = XenosGx::EFB_H;
+constexpr int VB_RING_BYTES = 8 << 20;
+constexpr int SYNC_COMMAND_DWORDS = (1 << 20) / 4;  // sync before libxenon's ring buffers can wrap
+
+class XenosBackend : public Video::GpuBackend {
+ public:
+  bool Init() {
+    m_efb_copy = Xe_CreateTexture(s_xe, EFB_W, EFB_H, 1, XE_FMT_8888 | XE_FMT_ARGB, 1);
+    m_efb_copy->use_filtering = 0;
+    m_efb_copy->u_addressing = XE_TEXADDR_CLAMP;
+    m_efb_copy->v_addressing = XE_TEXADDR_CLAMP;
+    m_vb = Xe_CreateVertexBuffer(s_xe, VB_RING_BYTES);
+    m_restore_vb = Xe_CreateVertexBuffer(s_xe, 6 * 6 * sizeof(float));
+    const float quad[6][6] = {
+        {-1, 1, 0, 1, 0, 0}, {1, 1, 0, 1, 1, 0}, {-1, -1, 0, 1, 0, 1},
+        {1, 1, 0, 1, 1, 0}, {1, -1, 0, 1, 1, 1}, {-1, -1, 0, 1, 0, 1},
+    };
+    void* v = Xe_VB_Lock(s_xe, m_restore_vb, 0, sizeof(quad), XE_LOCK_WRITE);
+    memcpy(v, quad, sizeof(quad));
+    Xe_VB_Unlock(s_xe, m_restore_vb);
+    return m_efb_copy && m_vb;
+  }
+
+  void Draw(const Video::GpuDrawState& st, const Video::GpuVertex* v, u32 count) override {
+    XenosGx::Prepare(st, v, count, m_pd);
+    Submit(m_pd, st.tex);
+  }
+
+  void ClearEFB(int x0, int y0, int x1, int y1, bool color, bool alpha, bool depth, u32 rgba, u32 z24) override {
+    XenosGx::PrepareClear(x0, y0, x1, y1, color, alpha, depth, rgba, z24, m_pd);
+    Submit(m_pd, nullptr);
+  }
+
+  // Copies the EDRAM EFB to memory so it can be restored after a present.
+  void SaveEFB() {
+    Xe_ResolveInto(s_xe, m_efb_copy, XE_SOURCE_COLOR, 0);
+    m_efb_copy_valid = true;
+  }
+
+  void ReadEFB(u32* color, u32* depth) override {
+    ActivateEFB();
+    Xe_ResolveInto(s_xe, m_efb_copy, XE_SOURCE_COLOR, 0);
+    Sync();
+    const u32* src = (const u32*)Xe_Surface_LockRect(s_xe, m_efb_copy, 0, 0, 0, 0, XE_LOCK_READ);
+    int pitch = ((EFB_W + 31) >> 5) << 5;
+    for (int y = 0; y < EFB_H; y++)
+      for (int x = 0; x < EFB_W; x++) {
+        // 32 bpp tiled layout (same as the console framebuffer)
+        int idx = (((y >> 5) * 32 * pitch + ((x >> 5) << 10) + (x & 3) + ((y & 1) << 2) + (((x & 31) >> 2) << 3) +
+                    (((y & 31) >> 1) << 6)) ^
+                   ((y & 8) << 2));
+        u32 argb = src[idx];
+        color[y * EFB_W + x] = (argb << 8) | (argb >> 24);  // -> 0xRRGGBBAA
+      }
+    Xe_Surface_Unlock(s_xe, m_efb_copy);
+    (void)depth;  // TODO: depth read-back (EFB depth copies, z peeks)
+    m_efb_copy_valid = true;
+  }
+
+ private:
+  struct GpuTex {
+    XenosSurface* surf;
+    u32 last_use;
+  };
+
+  void Sync() {
+    Xe_Sync(s_xe);
+    m_vb_offset = 0;
+    m_commands_since_sync = 0;
+  }
+
+  // Makes the EFB the render target again (after a frame was presented),
+  // restoring its color from the last read-back.
+  void ActivateEFB() {
+    if (s_efb_active) return;
+    if (!m_efb_rt) {
+      m_efb_rt = Xe_CreateTexture(s_xe, EFB_W, EFB_H, 1, XE_FMT_8888 | XE_FMT_ARGB, 1);
+    }
+    Xe_SetRenderTarget(s_xe, m_efb_rt);
+    Xe_InvalidateState(s_xe);
+    Xe_SetCullMode(s_xe, XE_CULL_NONE);
+    s_efb_active = true;
+    if (m_efb_copy_valid) {
+      Xe_SetZEnable(s_xe, 0);
+      Xe_SetBlendControl(s_xe, XE_BLEND_ONE, XE_BLENDOP_ADD, XE_BLEND_ZERO, XE_BLEND_ONE, XE_BLENDOP_ADD, XE_BLEND_ZERO);
+      Xe_SetScissor(s_xe, 0, -1, -1, -1, -1);
+      Xe_SetShader(s_xe, SHADER_TYPE_PIXEL, s_blit_ps, 0);
+      Xe_SetShader(s_xe, SHADER_TYPE_VERTEX, s_blit_vs, 0);
+      Xe_SetStreamSource(s_xe, 0, m_restore_vb, 0, 6);
+      Xe_SetTexture(s_xe, 0, m_efb_copy);
+      Xe_DrawPrimitive(s_xe, XE_PRIMTYPE_TRIANGLELIST, 0, 2);
+    }
+  }
+
+  XenosSurface* Texture(const Video::GpuTexture& t) {
+    auto it = m_textures.find(t.id);
+    if (it != m_textures.end()) {
+      it->second.last_use = m_frame;
+      return it->second.surf;
+    }
+    if (m_textures.size() > 512) EvictTextures();
+    XenosSurface* surf = Xe_CreateTexture(s_xe, t.width, t.height, 1, XE_FMT_8888 | XE_FMT_ARGB, 0);
+    u8* dst = (u8*)Xe_Surface_LockRect(s_xe, surf, 0, 0, 0, 0, XE_LOCK_WRITE);
+    for (int y = 0; y < t.height; y++) {
+      u32* row = (u32*)(dst + y * surf->wpitch);
+      const u8* s = t.rgba + (size_t)y * t.width * 4;
+      for (int x = 0; x < t.width; x++, s += 4) row[x] = ((u32)s[3] << 24) | ((u32)s[0] << 16) | ((u32)s[1] << 8) | s[2];
+    }
+    Xe_Surface_Unlock(s_xe, surf);
+    m_textures[t.id] = {surf, m_frame};
+    return surf;
+  }
+
+  void EvictTextures() {
+    Sync();  // nothing may still read the surfaces
+    for (auto& kv : m_textures) Xe_DestroyTexture(s_xe, kv.second.surf);
+    m_textures.clear();
+  }
+
+  static int Addressing(u32 gx_wrap) {
+    switch (gx_wrap) {
+      case 1: return XE_TEXADDR_WRAP;
+      case 2: return XE_TEXADDR_MIRROR;
+      default: return XE_TEXADDR_CLAMP;
+    }
+  }
+
+  XenosShader* ShaderObject(XenosGx::ShaderEntry* e) {
+    if (!e->backend_object) e->backend_object = CreateShader(e->shader);
+    return (XenosShader*)e->backend_object;
+  }
+
+  void Submit(const XenosGx::PreparedDraw& pd, const Video::GpuTexture* tex) {
+    if (!pd.vertex_count) return;
+    ActivateEFB();
+    u32 bytes = pd.vertex_count * pd.stride * 4;
+    if (bytes > (u32)VB_RING_BYTES) return;
+    if (m_vb_offset + bytes > (u32)VB_RING_BYTES || m_commands_since_sync > SYNC_COMMAND_DWORDS) Sync();
+    void* dst = Xe_VB_Lock(s_xe, m_vb, m_vb_offset, bytes, XE_LOCK_WRITE);
+    memcpy(dst, pd.vertices.data(), bytes);
+    Xe_VB_Unlock(s_xe, m_vb);
+
+    const XenosGx::RenderState& rs = pd.rs;
+    Xe_SetZEnable(s_xe, rs.z_enable || rs.z_write);
+    Xe_SetZFunc(s_xe, rs.z_enable ? rs.z_func : 7);
+    Xe_SetZWrite(s_xe, rs.z_write);
+    Xe_SetBlendControl(s_xe, rs.color_src, rs.color_op, rs.color_dst, rs.alpha_src, rs.alpha_op, rs.alpha_dst);
+    Xe_SetScissor(s_xe, 1, rs.sc_left, rs.sc_top, rs.sc_right, rs.sc_bottom);
+    Xe_SetShader(s_xe, SHADER_TYPE_PIXEL, ShaderObject(pd.ps), 0);
+    Xe_SetShader(s_xe, SHADER_TYPE_VERTEX, ShaderObject(pd.vs), 0);
+    Xe_SetPixelShaderConstantF(s_xe, 0, &pd.ps_consts[0][0], XenosGx::NUM_PS_CONSTS);
+    for (u32 t = 0; t < 8; t++) {
+      if (!(pd.tex_mask & (1u << t)) || !tex || !tex[t].rgba) continue;
+      XenosSurface* surf = Texture(tex[t]);
+      surf->use_filtering = tex[t].linear ? 1 : 0;
+      surf->u_addressing = Addressing(tex[t].wrap_s);
+      surf->v_addressing = Addressing(tex[t].wrap_t);
+      Xe_SetTexture(s_xe, t, surf);
+    }
+    Xe_SetStreamSource(s_xe, 0, m_vb, m_vb_offset, pd.stride);
+    int wptr = s_xe->rb_secondary_wptr;
+    Xe_DrawPrimitive(s_xe, XE_PRIMTYPE_TRIANGLELIST, 0, pd.vertex_count / 3);
+    Xe_pRBMayKick(s_xe);
+    int used = s_xe->rb_secondary_wptr - wptr;
+    m_commands_since_sync += used > 0 ? used : 64;
+    m_vb_offset += (bytes + 31) & ~31u;
+  }
+
+  XenosGx::PreparedDraw m_pd;
+  XenosSurface* m_efb_rt = nullptr;
+  XenosSurface* m_efb_copy = nullptr;
+  bool m_efb_copy_valid = false;
+  XenosVertexBuffer* m_vb = nullptr;
+  XenosVertexBuffer* m_restore_vb = nullptr;
+  u32 m_vb_offset = 0;
+  int m_commands_since_sync = 0;
+  u32 m_frame = 0;
+  std::unordered_map<u32, GpuTex> m_textures;
+};
+
+XenosBackend* s_backend = nullptr;
+
+}  // namespace
+
+void SaveEFBBeforePresent() {
+  if (s_backend) s_backend->SaveEFB();
+}
+
+bool InstallBackend() {
+  if (!s_xe) return false;
+  s_backend = new XenosBackend();
+  if (!s_backend->Init()) return false;
+  Video::g_gpu = s_backend;
+  return true;
 }
 
 }  // namespace XenosGpu

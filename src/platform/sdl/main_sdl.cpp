@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "xenos/sim.h"
 #include "core/gekko/block_cache.h"
 #include "core/gekko/cpu.h"
 #include "core/hle.h"
@@ -383,6 +384,7 @@ void Usage(const char* argv0) {
           "  --regs            print CPU registers on exit (debugging)\n"
           "  --interpreter     disable the block cache (plain interpreter)\n"
           "  --threads N       renderer threads (default: CPU cores, max 16)\n"
+          "  --gpu-sim         render through the Xenos GPU translation + microcode simulator\n"
           "  --osreport ADDR   log calls to the guest OSReport at ADDR (debugging)\n"
           "  --stats           print GPU statistics every 60 fields\n"
           "  --input SPEC      scripted pad input, e.g. 1000:start:10,1300:a:5\n"
@@ -417,6 +419,7 @@ int main(int argc, char** argv) {
     else if (a == "--regs") dump_regs = true;
     else if (a == "--interpreter") BlockCache::g_enabled = false;
     else if (a == "--threads" && i + 1 < argc) render_threads = atoi(argv[++i]);
+    else if (a == "--gpu-sim") XenosSim::Install();
     else if (a == "--stats") stats = true;
     else if (a == "--input" && i + 1 < argc) host.script = ParseScript(argv[++i]);
     else if (a == "--memcard" && i + 1 < argc) host.memcard_path = argv[++i];

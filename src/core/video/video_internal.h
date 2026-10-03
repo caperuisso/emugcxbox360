@@ -126,6 +126,8 @@ void TextureReset();
 void InvalidateTextureCache();
 // Decodes/looks up the textures of the units in `mask` before a draw.
 void BindTextures(u32 mask);
+struct GpuTexture;
+void GetGpuTexture(u32 texmap, GpuTexture& out);
 
 // Save state pieces
 void RasterDoState(StateBuffer& s);
@@ -140,5 +142,7 @@ void PrepareBlend();
 void EFBWriteDepth(int x, int y, u32 z);
 void EFBBlend(int x, int y, const u8 rgba[4]);
 void EFBCopy(u32 cmd);
+// A GPU backend drew into its EFB: the CPU copy must be refreshed before use.
+void MarkEFBGpuDirty();
 
 }  // namespace Video

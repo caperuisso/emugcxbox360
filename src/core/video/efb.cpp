@@ -7,14 +7,26 @@
 
 #include "core/memory.h"
 #include "core/state.h"
+#include "core/video/gpu_backend.h"
 #include "core/video/video_internal.h"
 
 namespace Video {
+
+GpuBackend* g_gpu = nullptr;
 
 namespace {
 
 u32* s_color = nullptr;  // RGBA packed as 0xRRGGBBAA
 u32* s_depth = nullptr;  // 24-bit depth
+bool s_mirror_stale = false;  // with a GPU backend: s_color/s_depth older than the GPU EFB
+
+// Refreshes the CPU copy of the EFB from the GPU backend when needed.
+void SyncMirror() {
+  if (g_gpu && s_mirror_stale) {
+    g_gpu->ReadEFB(s_color, s_depth);
+    s_mirror_stale = false;
+  }
+}
 
 inline u32 PixelFormat() { return Bits(g_bp[BP_ZCOMPARE], 0, 3); }
 
@@ -266,6 +278,12 @@ void Clear(int sx, int sy, int w, int h) {
   u8 c[4] = {(u8)ar, (u8)(gb >> 8), (u8)gb, (u8)(ar >> 8)};
   Quantize(c);
   u32 cz = g_bp[BP_CLEAR_Z] & 0xFFFFFF;
+  if (g_gpu) {
+    g_gpu->ClearEFB(std::max(0, sx), std::max(0, sy), std::min(EFB_WIDTH, sx + w), std::min(EFB_HEIGHT, sy + h), color,
+                    alpha, z, Pack(c), cz);
+    s_mirror_stale = true;
+    return;
+  }
   for (int y = std::max(0, sy); y < std::min(EFB_HEIGHT, sy + h); y++) {
     for (int x = std::max(0, sx); x < std::min(EFB_WIDTH, sx + w); x++) {
       u32& px = s_color[y * EFB_WIDTH + x];
@@ -282,6 +300,7 @@ void Clear(int sx, int sy, int w, int h) {
 }  // namespace
 
 void EFBDoState(StateBuffer& s) {
+  SyncMirror();
   s.DoBytes(s_color, EFB_WIDTH * EFB_HEIGHT * 4);
   s.DoBytes(s_depth, EFB_WIDTH * EFB_HEIGHT * 4);
 }
@@ -409,7 +428,10 @@ void EFBBlend(int x, int y, const u8 rgba[4]) {
   px = Pack(dst);
 }
 
+void MarkEFBGpuDirty() { s_mirror_stale = true; }
+
 void EFBCopy(u32 cmd) {
+  SyncMirror();
   int sx = (int)Bits(g_bp[BP_EFB_TL], 0, 10), sy = (int)Bits(g_bp[BP_EFB_TL], 10, 10);
   int w = (int)Bits(g_bp[BP_EFB_WH], 0, 10) + 1, h = (int)Bits(g_bp[BP_EFB_WH], 10, 10) + 1;
   if (Bits(cmd, 14, 1)) {
@@ -424,12 +446,14 @@ void EFBCopy(u32 cmd) {
 
 u32 PeekEFBColor(u32 x, u32 y) {
   if (x >= (u32)EFB_WIDTH || y >= (u32)EFB_HEIGHT) return 0;
+  SyncMirror();
   u8 c[4];
   Unpack(s_color[y * EFB_WIDTH + x], c);
   return ((u32)c[3] << 24) | ((u32)c[0] << 16) | ((u32)c[1] << 8) | c[2];
 }
 u32 PeekEFBDepth(u32 x, u32 y) {
   if (x >= (u32)EFB_WIDTH || y >= (u32)EFB_HEIGHT) return 0;
+  SyncMirror();
   return s_depth[y * EFB_WIDTH + x];
 }
 void PokeEFBColor(u32 x, u32 y, u32 argb) {
