@@ -484,6 +484,7 @@ int main() {
       int fps10 = (int)(stats_fields * 10000u / ms);
       int speed = fps10 * 10 / field_rate;
       snprintf(host.overlay, sizeof(host.overlay), "FPS %d.%d SPD %d%%", fps10 / 10, fps10 % 10, speed);
+      if (host.gpu) XenosGpu::SetOverlay(host.overlay);
       printf("[perf] %s\n", host.overlay);  // also on the UART
       stats_start = now;
       stats_fields = 0;

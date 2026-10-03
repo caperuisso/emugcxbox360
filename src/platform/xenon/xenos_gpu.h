@@ -14,6 +14,9 @@ bool Init();
 // aspect, by drawing it as a textured quad on the GPU.
 void Present(const uint32_t* argb, int width, int height, const char* overlay);
 
+// Text drawn over the picture (performance overlay).
+void SetOverlay(const char* text);
+
 // Renders GX draws on the GPU (Video::g_gpu). Requires Init().
 bool InstallBackend();
 

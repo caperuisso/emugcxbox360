@@ -6,6 +6,7 @@
 #include "core/coretiming.h"
 #include "core/hw/hw.h"
 #include "core/memory.h"
+#include "core/video/gpu_backend.h"
 #include "core/state.h"
 #include "platform/platform.h"
 
@@ -88,6 +89,8 @@ void PresentXFB() {
     g_host->PresentFrame(s_frame.data(), (int)width, (int)height);
     return;
   }
+  // A GPU backend may present the copy itself (no YUV round trip)
+  if (Video::g_gpu && Video::g_gpu->PresentXFB(top, (int)width, (int)height)) return;
   for (u32 y = 0; y < height; y++) {
     u32 line_addr;
     if (interlaced)

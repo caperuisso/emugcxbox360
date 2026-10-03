@@ -6,8 +6,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <vector>
 
+#include "platform/platform.h"
 #include "xenos/gx_draw.h"
 
 namespace XenosSim {
@@ -308,6 +310,40 @@ class SimBackend : public Video::GpuBackend {
     Execute(pd, nullptr);
   }
 
+  // XFB copies stay in the backend and are presented directly (as the real
+  // Xenos backend does), so this path is exercised on the PC too.
+  bool CopyToXFB(u32 dest, int sx, int sy, int w, int h, int out_h) override {
+    Frame& f = m_xfb[dest];
+    f.w = w;
+    f.h = out_h;
+    f.argb.resize((size_t)w * out_h);
+    for (int oy = 0; oy < out_h; oy++) {
+      int y = std::min(XenosGx::EFB_H - 1, std::max(0, sy + std::min(h - 1, oy * h / std::max(1, out_h))));
+      for (int x = 0; x < w; x++) {
+        int ex = std::min(XenosGx::EFB_W - 1, std::max(0, sx + x));
+        const float* c = m_color[(size_t)y * XenosGx::EFB_W + ex].v;
+        u32 r = (u32)std::lround(std::min(1.0f, std::max(0.0f, c[0])) * 255.0f);
+        u32 g = (u32)std::lround(std::min(1.0f, std::max(0.0f, c[1])) * 255.0f);
+        u32 b = (u32)std::lround(std::min(1.0f, std::max(0.0f, c[2])) * 255.0f);
+        f.argb[(size_t)oy * w + x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+      }
+    }
+    m_last = dest;
+    return true;
+  }
+
+  bool PresentXFB(u32 addr, int width, int height) override {
+    auto it = m_xfb.find(addr);
+    if (it == m_xfb.end()) it = m_xfb.find(m_last);
+    if (it == m_xfb.end() || !g_host) return false;
+    const Frame& f = it->second;
+    m_present.assign((size_t)width * height, 0xFF000000u);
+    for (int y = 0; y < std::min(height, f.h); y++)
+      for (int x = 0; x < std::min(width, f.w); x++) m_present[(size_t)y * width + x] = f.argb[(size_t)y * f.w + x];
+    g_host->PresentFrame(m_present.data(), width, height);
+    return true;
+  }
+
   void ReadEFB(u32* color, u32* depth) override {
     for (size_t i = 0; i < m_color.size(); i++) {
       const float* c = m_color[i].v;
@@ -413,6 +449,13 @@ class SimBackend : public Video::GpuBackend {
 
   std::vector<Vec4> m_color;
   std::vector<float> m_depth;
+  struct Frame {
+    int w = 0, h = 0;
+    std::vector<u32> argb;
+  };
+  std::map<u32, Frame> m_xfb;
+  u32 m_last = 0;
+  std::vector<u32> m_present;
 };
 
 }  // namespace

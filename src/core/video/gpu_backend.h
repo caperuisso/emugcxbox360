@@ -47,6 +47,15 @@ class GpuBackend {
   virtual void ClearEFB(int x0, int y0, int x1, int y1, bool color, bool alpha, bool depth, u32 rgba, u32 z24) = 0;
   // Reads the whole EFB: color as 0xRRGGBBAA, depth as 24-bit values.
   virtual void ReadEFB(u32* color, u32* depth) = 0;
+  // Copy of the EFB rectangle (sx, sy, w, h) to the external framebuffer at
+  // guest address `dest`, `out_h` lines after vertical scaling. A backend may
+  // keep it on the GPU and present it directly (PresentXFB); returning false
+  // selects the CPU path (YUV conversion into guest RAM).
+  virtual bool CopyToXFB(u32 dest, int sx, int sy, int w, int h, int out_h) { return false; }
+  // Shows the frame copied to `addr` (the VI's top field address) as a
+  // `width` x `height` picture (the VI's scan-out size, cropped/padded);
+  // false when the backend has nothing for it.
+  virtual bool PresentXFB(u32 addr, int width, int height) { return false; }
 };
 
 // nullptr: the built-in software rasterizer is used.

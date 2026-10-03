@@ -431,14 +431,26 @@ void EFBBlend(int x, int y, const u8 rgba[4]) {
 void MarkEFBGpuDirty() { s_mirror_stale = true; }
 
 void EFBCopy(u32 cmd) {
-  SyncMirror();
   int sx = (int)Bits(g_bp[BP_EFB_TL], 0, 10), sy = (int)Bits(g_bp[BP_EFB_TL], 10, 10);
   int w = (int)Bits(g_bp[BP_EFB_WH], 0, 10) + 1, h = (int)Bits(g_bp[BP_EFB_WH], 10, 10) + 1;
   if (Bits(cmd, 14, 1)) {
     g_stats.xfb_copies++;
-    CopyToXFB(cmd, sx, sy, w, h);
+    bool done = false;
+    if (g_gpu) {
+      u32 dest = (Bits(g_bp[BP_EFB_ADDR], 0, 24) << 5) & 0x01FFFFFF;
+      u32 yscale_reg = g_bp[BP_COPY_YSCALE] & 0x1FF;
+      float yscale = 1.0f;
+      if (yscale_reg) yscale = Bits(cmd, 10, 1) ? 256.0f / yscale_reg : yscale_reg / 256.0f;
+      int out_h = std::min(1024, (int)(1.0f + (h - 1) * yscale));
+      done = g_gpu->CopyToXFB(dest, sx, sy, w, h, out_h);
+    }
+    if (!done) {
+      SyncMirror();
+      CopyToXFB(cmd, sx, sy, w, h);
+    }
   } else {
     g_stats.efb_copies++;
+    SyncMirror();
     CopyToTexture(cmd, sx, sy, w, h);
   }
   if (Bits(cmd, 11, 1)) Clear(sx, sy, w, h);
