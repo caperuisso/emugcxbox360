@@ -403,6 +403,7 @@ class XenosBackend : public Video::GpuBackend {
     }
     Xe_Surface_Unlock(s_xe, surf);
     m_textures[t.id] = {surf, m_frame};
+    m_texture_bytes += (u32)surf->wpitch * (u32)surf->hpitch;
     return surf;
   }
 
@@ -410,6 +411,7 @@ class XenosBackend : public Video::GpuBackend {
     Sync();  // nothing may still read the surfaces
     for (auto& kv : m_textures) Xe_DestroyTexture(s_xe, kv.second.surf);
     m_textures.clear();
+    m_texture_bytes = 0;
     for (BoundTex& bt : m_bound) bt = BoundTex();
   }
 
@@ -458,7 +460,8 @@ class XenosBackend : public Video::GpuBackend {
       m_consts_valid = nconst;
     }
     // evict before binding: a draw must not lose a surface it already bound
-    if (m_textures.size() > 504) EvictTextures();
+    // (by count and by memory: EFB copies make a new 1.3 MB texture per frame)
+    if (m_textures.size() > 504 || m_texture_bytes > TEXTURE_BUDGET) EvictTextures();
     for (u32 t = 0; t < 8; t++) {
       if (!(pd.tex_mask & (1u << t)) || !tex || !tex[t].rgba) continue;
       XenosSurface* surf = Texture(tex[t]);
@@ -505,6 +508,9 @@ class XenosBackend : public Video::GpuBackend {
   int m_commands_since_sync = 0;
   u32 m_frame = 0;
   std::unordered_map<u32, GpuTex> m_textures;
+  u32 m_texture_bytes = 0;
+  // Each draw binds at most 8 textures (<= 4 MB each) on top of this.
+  static constexpr u32 TEXTURE_BUDGET = 48u << 20;
 };
 
 XenosBackend* s_backend = nullptr;
