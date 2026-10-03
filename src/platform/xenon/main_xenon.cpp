@@ -472,11 +472,27 @@ int main() {
 
   u64 stats_start = mftb();
   int stats_fields = 0;
+  // Frame limiter: never run faster than the console's field rate
+  u64 pace_start = mftb();
+  u32 pace_fields = 0;
   for (;;) {
     usb_do_poll();
     System::RunFrame();
     GuardText("frame");
     stats_fields++;
+    {
+      u32 rate = Mem::PhysRead32(0xCC) == 1 ? 50 : 60;
+      pace_fields++;
+      u64 expected = (u64)pace_fields * 1000000u / rate;
+      u64 elapsed = tb_diff_usec(mftb(), pace_start);
+      if (elapsed < expected) {
+        u64 wait = expected - elapsed;
+        udelay((int)(wait > 40000 ? 40000 : wait));
+      } else if (elapsed > expected + 100000) {
+        pace_start = mftb();  // too slow: do not try to catch up
+        pace_fields = 0;
+      }
+    }
     u64 now = mftb();
     if (tb_diff_msec(now, stats_start) >= 1000) {
       // Emulated speed relative to the console's field rate (50 Hz PAL, 60 Hz NTSC).
