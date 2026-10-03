@@ -28,6 +28,15 @@ void SyncMirror() {
   }
 }
 
+// Same for a rectangle and the needed planes only (the copy stays stale).
+void SyncMirrorRect(int x0, int y0, int x1, int y1, bool color, bool depth) {
+  if (!g_gpu || !s_mirror_stale) return;
+  x0 = std::max(0, x0), y0 = std::max(0, y0);
+  x1 = std::min(EFB_WIDTH, x1), y1 = std::min(EFB_HEIGHT, y1);
+  if (x0 >= x1 || y0 >= y1) return;
+  g_gpu->ReadEFBRect(x0, y0, x1, y1, color, depth, s_color, s_depth);
+}
+
 inline u32 PixelFormat() { return Bits(g_bp[BP_ZCOMPARE], 0, 3); }
 
 inline u32 Pack(const u8* c) { return ((u32)c[0] << 24) | ((u32)c[1] << 16) | ((u32)c[2] << 8) | c[3]; }
@@ -445,12 +454,13 @@ void EFBCopy(u32 cmd) {
       done = g_gpu->CopyToXFB(dest, sx, sy, w, h, out_h);
     }
     if (!done) {
-      SyncMirror();
+      SyncMirrorRect(sx, sy - 1, sx + w, sy + h + 1, true, false);
       CopyToXFB(cmd, sx, sy, w, h);
     }
   } else {
     g_stats.efb_copies++;
-    SyncMirror();
+    bool depth = PixelFormat() == 3;
+    SyncMirrorRect(sx, sy, sx + w + 1, sy + h + 1, !depth, depth);
     CopyToTexture(cmd, sx, sy, w, h);
   }
   if (Bits(cmd, 11, 1)) Clear(sx, sy, w, h);
@@ -458,14 +468,14 @@ void EFBCopy(u32 cmd) {
 
 u32 PeekEFBColor(u32 x, u32 y) {
   if (x >= (u32)EFB_WIDTH || y >= (u32)EFB_HEIGHT) return 0;
-  SyncMirror();
+  SyncMirrorRect((int)x, (int)y, (int)x + 1, (int)y + 1, true, false);
   u8 c[4];
   Unpack(s_color[y * EFB_WIDTH + x], c);
   return ((u32)c[3] << 24) | ((u32)c[0] << 16) | ((u32)c[1] << 8) | c[2];
 }
 u32 PeekEFBDepth(u32 x, u32 y) {
   if (x >= (u32)EFB_WIDTH || y >= (u32)EFB_HEIGHT) return 0;
-  SyncMirror();
+  SyncMirrorRect((int)x, (int)y, (int)x + 1, (int)y + 1, false, true);
   return s_depth[y * EFB_WIDTH + x];
 }
 void PokeEFBColor(u32 x, u32 y, u32 argb) {

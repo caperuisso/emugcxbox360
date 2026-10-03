@@ -273,6 +273,32 @@ class XenosBackend : public Video::GpuBackend {
     return true;
   }
 
+  void ReadEFBRect(int x0, int y0, int x1, int y1, bool color, bool depth, u32* cbuf, u32* zbuf) override {
+    ActivateEFB();
+    if (color) Xe_ResolveInto(s_xe, m_efb_copy, XE_SOURCE_COLOR, 0);
+    if (depth) Xe_ResolveInto(s_xe, m_depth_copy, XE_SOURCE_DS, 0);
+    Sync();
+    const u32* src = color ? (const u32*)Xe_Surface_LockRect(s_xe, m_efb_copy, 0, 0, 0, 0, XE_LOCK_READ) : nullptr;
+    const u32* zsrc = depth ? (const u32*)Xe_Surface_LockRect(s_xe, m_depth_copy, 0, 0, 0, 0, XE_LOCK_READ) : nullptr;
+    int pitch = ((EFB_W + 31) >> 5) << 5;
+    for (int y = y0; y < y1; y++)
+      for (int x = x0; x < x1; x++) {
+        int idx = (((y >> 5) * 32 * pitch + ((x >> 5) << 10) + (x & 3) + ((y & 1) << 2) + (((x & 31) >> 2) << 3) +
+                    (((y & 31) >> 1) << 6)) ^
+                   ((y & 8) << 2));
+        if (src) {
+          u32 argb = src[idx];
+          cbuf[y * EFB_W + x] = (argb << 8) | (argb >> 24);
+        }
+        if (zsrc) zbuf[y * EFB_W + x] = zsrc[idx] >> 8;
+      }
+    if (zsrc) Xe_Surface_Unlock(s_xe, m_depth_copy);
+    if (src) {
+      Xe_Surface_Unlock(s_xe, m_efb_copy);
+      m_efb_copy_valid = true;
+    }
+  }
+
   void ReadEFB(u32* color, u32* depth) override {
     ActivateEFB();
     Xe_ResolveInto(s_xe, m_efb_copy, XE_SOURCE_COLOR, 0);

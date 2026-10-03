@@ -1,21 +1,32 @@
 # Working plan (performance on the Xbox 360)
 
 Status legend: [x] done, [~] in progress, [ ] to do. Every step is verified on
-the PC (reference images, qemu-ppc big-endian run) before going to the console.
+the PC (reference images, qemu-ppc big-endian runs) before going to the console.
 
 ## GPU rendering (Xenos)
 - [x] Run-time Xenos microcode builder (`src/xenos/ucode.h`), checked against XDK shaders
 - [x] GPU display path (textured quad) — confirmed working on hardware
-- [x] Core backend interface (`src/core/video/gpu_backend.h`)
-- [ ] Core hooks: triangles, EFB clears, lazy EFB read-back for copies/peeks
-- [ ] GX -> Xenos translation (`src/xenos/gx_draw.*`): TEV pixel shaders, vertex shader, constants, render states
-- [ ] Xenos microcode simulator + simulated backend on the PC, compared to the software renderer
-- [ ] Real Xenos backend (libxenon Xe), EFB in EDRAM, resolves for EFB copies
-- [ ] XFB copies presented directly from the GPU (no YUV round trip)
+- [x] Core backend interface (`src/core/video/gpu_backend.h`) and hooks (triangles, clears, lazy EFB read-back)
+- [x] GX -> Xenos translation (`src/xenos/gx_draw.*`): TEV pixel shaders (lerp/compare, swaps, konst,
+      alpha test, fog, indirect texturing), vertex shader, constants, render states, half-pixel offset
+- [x] Xenos microcode simulator + simulated backend (`--gpu-sim`): mean difference to the software
+      renderer 0.02-2.6 per channel on the WW title/intro (edges and the missing copy filter)
+- [x] Real Xenos backend (libxenon Xe): EFB in EDRAM, texture cache, vertex ring, read-back of
+      color and depth (rectangles only), restore after presents — untested on hardware
+- [x] XFB copies presented straight from the GPU (no YUV round trip)
+- [ ] Mipmaps / LOD bias on the GPU path (level 0 only for now)
+- [ ] EFB copies to textures kept on the GPU (avoid the read-back)
+- [ ] Vertex transform on the GPU (currently CPU, cheap so far)
 
-## CPU
-- [ ] PPC -> PPC JIT (lockstep-verified against the interpreter under qemu-ppc)
-- [ ] Faster memory access paths (fast RAM path, fewer BitCast round trips)
+## CPU (PowerPC JIT, `src/core/jit/`)
+- [x] v1-v2: blocks as host code, inline integer ALU (re-emitted guest instructions)
+- [x] v3-v6: inline loads/stores with a RAM fast path, FP arithmetic, psq_l/psq_st (float GQR)
+- [x] v7-v8: carries, CR moves, FP moves/merges/compares, mtlr/mtctr (no block split)
+- [x] v9: generated dispatcher chaining blocks
+- Each version verified bit-identical to the interpreter over 300 WW fields under qemu-ppc.
+- [ ] Guest register caching across instructions (currently loaded/stored per instruction)
+- [ ] Quantized psq types (u8/s16 with scale), remaining interpreted instructions
 
 ## Other
 - [ ] Audio/DSP and frame pacing costs on the console
+- [ ] Measure on hardware: FPS with JIT on/off (Start), GPU rendering on/off (B)

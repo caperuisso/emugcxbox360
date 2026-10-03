@@ -344,6 +344,20 @@ class SimBackend : public Video::GpuBackend {
     return true;
   }
 
+  void ReadEFBRect(int x0, int y0, int x1, int y1, bool color, bool depth, u32* cbuf, u32* zbuf) override {
+    for (int y = y0; y < y1; y++)
+      for (int x = x0; x < x1; x++) {
+        size_t i = (size_t)y * XenosGx::EFB_W + x;
+        if (color) {
+          const float* c = m_color[i].v;
+          u8 b[4];
+          for (int k = 0; k < 4; k++) b[k] = (u8)std::lround(std::min(1.0f, std::max(0.0f, c[k])) * 255.0f);
+          cbuf[i] = ((u32)b[0] << 24) | ((u32)b[1] << 16) | ((u32)b[2] << 8) | b[3];
+        }
+        if (depth) zbuf[i] = (u32)std::lround(std::min(1.0f, std::max(0.0f, m_depth[i])) * 16777215.0f);
+      }
+  }
+
   void ReadEFB(u32* color, u32* depth) override {
     for (size_t i = 0; i < m_color.size(); i++) {
       const float* c = m_color[i].v;
