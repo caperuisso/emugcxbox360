@@ -11,7 +11,7 @@ ARCH    := -m32 -mcpu=7450 -mno-powerpc64 -maltivec -mhard-float -fno-pic
 CXXFLAGS := -O2 $(EXTRA) -fno-strict-aliasing -std=gnu++17 $(ARCH) -Isrc -Ithird_party
 CFLAGS   := -O2 $(EXTRA) $(ARCH) -Ithird_party
 
-CORE := $(shell find src/core -name '*.cpp' -not -path 'src/core/jit/*')
+CORE := $(shell find src/core src/xenos -name '*.cpp')
 OBJS := $(patsubst %.cpp,$(OUT)/%.o,$(CORE) tests/headless_main.cpp) \
         $(OUT)/third_party/zstd/zstddeclib.o $(OUT)/tests/ppc_linux/shim.o $(OUT)/tests/ppc_linux/start.o
 

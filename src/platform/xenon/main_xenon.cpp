@@ -24,6 +24,7 @@ extern "C" {
 int bdev_enum(int handle, const char** name);
 }
 
+#include "core/jit/jit.h"
 #include "core/memory.h"
 #include "platform/xenon/xenos_gpu.h"
 #include "core/system.h"
@@ -361,8 +362,9 @@ std::string PickGame() {
     if (sel != shown) {
       console_clrscr();
       printf("emugcxbox360 - choose a game\n");
-      printf("  A: start   X: multi-thread software renderer %s   Y: GPU display %s   B: GPU rendering %s   Guide: quit\n\n",
+      printf("  A: start   X: multi-thread software renderer %s   Y: GPU display %s   B: GPU rendering %s\n",
              g_use_threads ? "ON" : "OFF", g_use_gpu ? "ON" : "OFF", g_gpu_render && g_use_gpu ? "ON" : "OFF");
+      printf("  Start: CPU recompiler (JIT) %s   Guide: quit\n\n", Jit::Enabled() ? "ON" : "OFF");
       int first = std::max(0, sel - 10);
       for (int i = first; i < (int)games.size() && i < first + 20; i++)
         printf("%s %s\n", i == sel ? ">" : " ", games[i].c_str());
@@ -386,6 +388,12 @@ std::string PickGame() {
       shown = -1;
     }
     y_was_down = c.y;
+    static bool start_was_down = false;
+    if (c.start && !start_was_down) {
+      Jit::SetEnabled(!Jit::Enabled());
+      shown = -1;
+    }
+    start_was_down = c.start;
     static bool b_was_down = false;
     if (c.b && !b_was_down) {
       g_gpu_render = !g_gpu_render;

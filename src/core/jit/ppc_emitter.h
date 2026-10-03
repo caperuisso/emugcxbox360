@@ -39,6 +39,11 @@ class PPCEmitter {
   void cmpwi(u32 crf, u32 ra, s32 imm) { Emit(D(11, crf << 2, ra, imm)); }
   void cmplwi(u32 crf, u32 ra, u32 imm) { Emit(D(10, crf << 2, ra, (s32)imm)); }
   void cmpw(u32 crf, u32 ra, u32 rb) { Emit(X(31, crf << 2, ra, rb, 0)); }
+  void cmplw(u32 crf, u32 ra, u32 rb) { Emit(X(31, crf << 2, ra, rb, 32)); }
+  void addic(u32 rt, u32 ra, s32 imm) { Emit(D(12, rt, ra, imm)); }
+  void addze(u32 rt, u32 ra) { Emit(XO(rt, ra, 0, 202)); }
+  void add(u32 rt, u32 ra, u32 rb) { Emit(XO(rt, ra, rb, 266)); }
+  void subf(u32 rt, u32 ra, u32 rb) { Emit(XO(rt, ra, rb, 40)); }
   void mr(u32 ra, u32 rs) { Emit(X(31, rs, ra, rs, 444)); }
   // Loads a 32-bit constant in one or two instructions.
   void LoadImm(u32 rt, u32 value) {
@@ -59,6 +64,8 @@ class PPCEmitter {
 
   // ---- Memory ----
   void lwz(u32 rt, s32 d, u32 ra) { Emit(D(32, rt, ra, d)); }
+  void lbz(u32 rt, s32 d, u32 ra) { Emit(D(34, rt, ra, d)); }
+  void stb(u32 rs, s32 d, u32 ra) { Emit(D(38, rs, ra, d)); }
   void stw(u32 rs, s32 d, u32 ra) { Emit(D(36, rs, ra, d)); }
   void stwu(u32 rs, s32 d, u32 ra) { Emit(D(37, rs, ra, d)); }
   void lfd(u32 frt, s32 d, u32 ra) { Emit(D(50, frt, ra, d)); }
@@ -89,6 +96,13 @@ class PPCEmitter {
   void b(s32 offset_insts) { Emit((18u << 26) | (((u32)offset_insts << 2) & 0x03FFFFFC)); }
   void bc(u32 bo, u32 bi, s32 offset_insts) { Emit((16u << 26) | (bo << 21) | (bi << 16) | (((u32)offset_insts << 2) & 0xFFFC)); }
   void blr() { Emit(0x4E800020); }
+  void bctr() { Emit(0x4E800420); }
+  // Calls an absolute address through CTR (clobbers r12).
+  void CallAbs(u32 addr) {
+    LoadImm(12, addr);
+    mtctr(12);
+    bctrl();
+  }
   void bctrl() { Emit(0x4E800421); }
   // Emits a placeholder conditional branch; returns its index for PatchBranch.
   u32 bc_forward(u32 bo, u32 bi) {

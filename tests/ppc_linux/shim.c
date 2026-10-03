@@ -71,7 +71,7 @@ void* sbrk(ptrdiff_t incr) {
   static size_t used = 0;
   const size_t size = 1u << 30;
   if (!base) {
-    long r = sys(90, 0, size, 3, 0x22, -1, 0);  /* mmap anonymous */
+    long r = sys(90, 0, size, 7, 0x22, -1, 0);  /* mmap anonymous, executable (JIT code) */
     if (r < 0 && r > -4096) { errno = ENOMEM; return (void*)-1; }
     base = (char*)r;
   }

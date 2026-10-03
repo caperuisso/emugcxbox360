@@ -14,6 +14,7 @@
 #include "core/system.h"
 #include "platform/platform.h"
 #include "xenos/sim.h"
+#include "core/jit/jit.h"
 
 namespace {
 
@@ -78,6 +79,8 @@ int main(int argc, char** argv) {
   HeadlessHost host;
   const char* gpu = getenv("EMUGC_GPU");
   if (gpu && !strcmp(gpu, "sim")) XenosSim::Install();  // GPU path through the Xenos simulator
+  const char* jit = getenv("EMUGC_JIT");
+  if (jit && !strcmp(jit, "0")) Jit::SetEnabled(false);
   int fields = atoi(argv[2]);
   if (!System::Init(&host) || !System::Boot(argv[1])) {
     printf("boot failed\n");
@@ -92,6 +95,7 @@ int main(int argc, char** argv) {
              (unsigned long long)Fnv(Mem::g_mem1, Mem::MEM1_SIZE));
     fflush(stdout);
   }
+  if (Jit::Enabled()) printf("jit code: %u bytes\n", (unsigned)Jit::CodeBytes());
   System::Shutdown();
   return 0;
 }

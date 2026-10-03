@@ -10,6 +10,7 @@
 
 #include "core/coretiming.h"
 #include "core/gekko/interp_internal.h"
+#include "core/jit/jit.h"
 #include "core/memory.h"
 
 namespace BlockCache {
@@ -26,6 +27,7 @@ struct Decoded {
 struct Block {
   u32 first;  // index into s_code
   u32 count;
+  Jit::BlockFn jit;  // compiled code, or nullptr (interpreted)
 };
 
 constexpr u32 PAGE_SHIFT = 12;
@@ -34,6 +36,7 @@ constexpr u32 MAX_BLOCK = 64;
 constexpr size_t MAX_CODE = 4u << 20;  // decoded instructions before a full flush
 
 u32* s_map = nullptr;       // physical word index -> block id + 1 (0 = none)
+bool s_jit_full = false;    // code buffer exhausted: clear everything at the next block
 u8* s_page_used = nullptr;  // pages that currently hold blocks
 std::vector<Block> s_blocks;
 std::vector<Decoded> s_code;
@@ -63,6 +66,7 @@ Block* Compile(u32 pa) {
   Block b;
   b.first = (u32)s_code.size();
   b.count = 0;
+  b.jit = nullptr;
   u32 addr = pa;
   const u8* mem = Mem::g_mem1;
   do {
@@ -72,6 +76,16 @@ Block* Compile(u32 pa) {
     addr += 4;
     if (EndsBlock(inst)) break;
   } while (b.count < MAX_BLOCK && (addr & ((1u << PAGE_SHIFT) - 1)) != 0 && addr < Mem::MEM1_SIZE);
+  if (Jit::Enabled()) {
+    u32 insts[MAX_BLOCK];
+    Interpreter::OpFn fns[MAX_BLOCK];
+    for (u32 k = 0; k < b.count; k++) {
+      insts[k] = s_code[b.first + k].inst;
+      fns[k] = s_code[b.first + k].fn;
+    }
+    b.jit = Jit::Compile(insts, fns, b.count);
+    if (!b.jit) s_jit_full = true;
+  }
   s_blocks.push_back(b);
   s_map[pa >> 2] = (u32)s_blocks.size();
   s_page_used[pa >> PAGE_SHIFT] = 1;
@@ -87,6 +101,8 @@ void Init() {
 }
 
 void Clear() {
+  Jit::Clear();
+  s_jit_full = false;
   if (s_map) memset(s_map, 0, Mem::MEM1_SIZE);
   if (s_page_used) memset(s_page_used, 0, NUM_PAGES);
   s_blocks.clear();
@@ -115,8 +131,13 @@ void Run() {
       CPU::Step();  // falls back to the plain interpreter (raises ISI if needed)
       continue;
     }
+    if (UNLIKELY(s_jit_full)) Clear();
     u32 id = s_map[pa >> 2];
     const Block* b = id ? &s_blocks[id - 1] : Compile(pa);
+    if (b->jit) {
+      b->jit();
+      continue;
+    }
     const Decoded* code = &s_code[b->first];
     for (u32 k = 0; k < b->count; k++) {
       const u32 pc = cpu.pc;
