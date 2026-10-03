@@ -200,7 +200,10 @@ namespace {
 
 constexpr int EFB_W = XenosGx::EFB_W, EFB_H = XenosGx::EFB_H;
 constexpr int VB_RING_BYTES = 8 << 20;
-constexpr int SYNC_COMMAND_DWORDS = (1 << 20) / 4;  // sync before libxenon's ring buffers can wrap
+// libxenon kicks the GPU every 1024 command dwords, each kick using ~35 of
+// the 8192 primary ring entries: the primary ring wraps after ~240K dwords
+// and nothing checks that the GPU caught up. Sync well before that.
+constexpr int SYNC_COMMAND_DWORDS = (512 << 10) / 4;
 
 class XenosBackend : public Video::GpuBackend {
  public:
