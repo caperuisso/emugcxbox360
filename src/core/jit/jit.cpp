@@ -80,7 +80,8 @@ constexpr u32 R_ENTRY = 22;  // block id -> generated code
 constexpr u32 R_IBAT = 21;   // instruction BAT table
 constexpr int FRAME = 96;    // r14-r31 saved at 16..84
 // Guest GPRs cached in host registers within a block
-constexpr u32 CACHE_FIRST = 14, CACHE_COUNT = 7;  // r14-r20
+constexpr u32 CACHE_FIRST = 14, CACHE_COUNT = 6;  // r14-r19
+constexpr u32 R_CRC = 20;  // guest CR, cached for the whole block
 
 constexpr s32 OFF_GPR = (s32)offsetof(CPUState, gpr);
 constexpr s32 OFF_PC = (s32)offsetof(CPUState, pc);
@@ -337,6 +338,22 @@ void Reset() {
 // reloaded after interpreter calls.
 u32 s_cache[32];
 u32 s_cache_written;  // guest registers written in the block (bit mask)
+bool s_cr_cached = false, s_cr_written = false;
+
+inline void LoadCR(PPCEmitter& e, u32 h) {
+  if (s_cr_cached)
+    e.mr(h, R_CRC);
+  else
+    e.lwz(h, OFF_CR, R_CPU);
+}
+inline void StoreCR(PPCEmitter& e, u32 h) {
+  if (s_cr_cached) {
+    e.mr(R_CRC, h);
+    s_cr_written = true;
+  } else {
+    e.stw(h, OFF_CR, R_CPU);
+  }
+}
 
 inline void LoadGpr(PPCEmitter& e, u32 h, u32 g) {
   if (s_cache[g])
@@ -355,10 +372,12 @@ inline void StoreGpr(PPCEmitter& e, u32 h, u32 g) {
 void CacheWriteBack(PPCEmitter& e) {
   for (u32 g = 0; g < 32; g++)
     if (s_cache[g] && (s_cache_written & (1u << g))) e.stw(s_cache[g], Gpr(g), R_CPU);
+  if (s_cr_cached && s_cr_written) e.stw(R_CRC, OFF_CR, R_CPU);
 }
 void CacheReload(PPCEmitter& e) {
   for (u32 g = 0; g < 32; g++)
     if (s_cache[g]) e.lwz(s_cache[g], Gpr(g), R_CPU);
+  if (s_cr_cached) e.lwz(R_CRC, OFF_CR, R_CPU);
 }
 
 // Chooses the guest registers to cache: the most used ones (at least twice).
@@ -389,9 +408,9 @@ void UpdateGuestCR(PPCEmitter& e, u32 f) {
   e.lwz(8, OFF_XER, R_CPU);
   e.rlwinm(8, 8, 1, 31, 31);  // SO -> bit 0
   e.Emit(PPCEmitter::X(31, 7, 7, 8, 444));  // or r7, r7, r8
-  e.lwz(9, OFF_CR, R_CPU);
+  LoadCR(e, 9);
   e.rlwimi(9, 7, (28 - 4 * f) & 31, 4 * f, 4 * f + 3);
-  e.stw(9, OFF_CR, R_CPU);
+  StoreCR(e, 9);
 }
 
 inline u32 Field(u32 inst, u32 shift) { return (inst >> shift) & 31; }
@@ -505,7 +524,7 @@ bool EmitInline(PPCEmitter& e, u32 inst) {
           return true;
         }
         case 19:  // mfcr
-          e.lwz(6, OFF_CR, R_CPU);
+          LoadCR(e, 6);
           StoreGpr(e, 6, rd);
           return true;
         case 144: {  // mtcrf
@@ -513,12 +532,12 @@ bool EmitInline(PPCEmitter& e, u32 inst) {
           for (int f = 0; f < 8; f++)
             if (crm & (0x80 >> f)) mask |= 0xF0000000u >> (4 * f);
           LoadGpr(e, 3, rd);
-          e.lwz(4, OFF_CR, R_CPU);
+          LoadCR(e, 4);
           e.LoadImm(5, mask);
           e.Emit(PPCEmitter::X(31, 3, 3, 5, 28));   // and r3, r3, r5
           e.Emit(PPCEmitter::X(31, 4, 4, 5, 60));   // andc r4, r4, r5
           e.Emit(PPCEmitter::X(31, 3, 3, 4, 444));  // or r3, r3, r4
-          e.stw(3, OFF_CR, R_CPU);
+          StoreCR(e, 3);
           return true;
         }
         case 104: {  // neg
@@ -847,9 +866,9 @@ bool EmitFpCompare(PPCEmitter& e, u32 inst, std::vector<u32>& slow) {
   e.Emit(PPCEmitter::X(63, 0, 1, 2, 0));  // fcmpu cr0, f1, f2
   e.mfcr(0);
   e.rlwinm(7, 0, 4, 28, 31);  // code in the low nibble
-  e.lwz(9, OFF_CR, R_CPU);
+  LoadCR(e, 9);
   e.rlwimi(9, 7, (28 - 4 * crf) & 31, 4 * crf, 4 * crf + 3);
-  e.stw(9, OFF_CR, R_CPU);
+  StoreCR(e, 9);
   // FPSCR: clear FPRF's C bit (0x10000), FPCC = code
   e.lwz(9, OFF_FPSCR, R_CPU);
   e.rlwinm(9, 9, 0, 16, 14);
@@ -926,7 +945,7 @@ bool EmitBranch(PPCEmitter& e, u32 inst) {
     fail.push_back(e.bc_forward((bo & 2) ? PPCEmitter::BO_FALSE : PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
   }
   if (!(bo & 16)) {
-    e.lwz(6, OFF_CR, R_CPU);
+    LoadCR(e, 6);
     e.rlwinm(6, 6, (bi + 1) & 31, 31, 31);
     e.cmpwi(0, 6, (s32)((bo >> 3) & 1));
     fail.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_EQ));
@@ -1173,6 +1192,8 @@ bool Compile(u32 id, const u32* insts, const Interpreter::OpFn* fns, u32 count) 
 
   PlanCache(insts, count);
   if (!s_inline_enabled) memset(s_cache, 0, sizeof(s_cache));
+  s_cr_cached = s_inline_enabled;
+  s_cr_written = false;
   CacheReload(e);  // block entry
 
   bool ended = false;
