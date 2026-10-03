@@ -22,6 +22,7 @@
 
 #include "core/coretiming.h"
 #include "core/jit/ppc_emitter.h"
+#include "core/memory.h"
 
 namespace Jit {
 
@@ -71,7 +72,10 @@ constexpr u32 R_BUDGET = 30;
 constexpr u32 R_LINK = 29;
 constexpr u32 R_PC = 28;
 constexpr u32 R_PENDING = 27;
-constexpr int FRAME = 32;
+constexpr u32 R_MEM1 = 26;   // Mem::g_mem1
+constexpr u32 R_DBAT = 25;   // data BAT table
+constexpr u32 R_STAMP = 24;  // Mem::g_page_stamp
+constexpr int FRAME = 48;    // r24-r31 saved at 16..44
 
 constexpr s32 OFF_GPR = (s32)offsetof(CPUState, gpr);
 constexpr s32 OFF_PC = (s32)offsetof(CPUState, pc);
@@ -81,6 +85,7 @@ constexpr s32 OFF_XER = (s32)offsetof(CPUState, xer);
 constexpr s32 OFF_SPR = (s32)offsetof(CPUState, spr);
 constexpr s32 OFF_CYC = (s32)offsetof(CPUState, cycles);  // big-endian u64: high word first
 constexpr s32 OFF_EXC = (s32)offsetof(CPUState, exceptions);
+constexpr s32 OFF_MSR = (s32)offsetof(CPUState, msr);
 static_assert(OFF_SPR + 1024 * 4 < 32768, "CPU state offsets must fit a 16-bit displacement");
 
 inline s32 Gpr(u32 n) { return OFF_GPR + (s32)n * 4; }
@@ -362,6 +367,111 @@ bool EmitInline(PPCEmitter& e, u32 inst) {
 
 bool s_inline_enabled = true;
 
+// Load/store with a fast path for guest RAM. Returns false when the
+// instruction is not a supported load/store. Emits:
+//   fast path (translated address in MEM1)  -> inline bookkeeping, b next
+//   slow path -> the interpreter handler (falls through to the caller's code)
+struct MemOp {
+  bool store;
+  u32 size;     // 1, 2, 4
+  bool sign;    // lha
+  bool update;  // xxxu forms
+  bool indexed;
+};
+
+bool DecodeMemOp(u32 inst, MemOp& m) {
+  u32 op = inst >> 26;
+  m.indexed = false;
+  switch (op) {
+    case 32: m = {false, 4, false, false, false}; return true;  // lwz
+    case 33: m = {false, 4, false, true, false}; return true;   // lwzu
+    case 34: m = {false, 1, false, false, false}; return true;  // lbz
+    case 35: m = {false, 1, false, true, false}; return true;   // lbzu
+    case 36: m = {true, 4, false, false, false}; return true;   // stw
+    case 37: m = {true, 4, false, true, false}; return true;    // stwu
+    case 38: m = {true, 1, false, false, false}; return true;   // stb
+    case 39: m = {true, 1, false, true, false}; return true;    // stbu
+    case 40: m = {false, 2, false, false, false}; return true;  // lhz
+    case 41: m = {false, 2, false, true, false}; return true;   // lhzu
+    case 42: m = {false, 2, true, false, false}; return true;   // lha
+    case 43: m = {false, 2, true, true, false}; return true;    // lhau
+    case 44: m = {true, 2, false, false, false}; return true;   // sth
+    case 45: m = {true, 2, false, true, false}; return true;    // sthu
+    case 31:
+      switch ((inst >> 1) & 0x3FF) {
+        case 23: m = {false, 4, false, false, true}; return true;   // lwzx
+        case 55: m = {false, 4, false, true, true}; return true;    // lwzux
+        case 87: m = {false, 1, false, false, true}; return true;   // lbzx
+        case 119: m = {false, 1, false, true, true}; return true;   // lbzux
+        case 151: m = {true, 4, false, false, true}; return true;   // stwx
+        case 183: m = {true, 4, false, true, true}; return true;    // stwux
+        case 215: m = {true, 1, false, false, true}; return true;   // stbx
+        case 247: m = {true, 1, false, true, true}; return true;    // stbux
+        case 279: m = {false, 2, false, false, true}; return true;  // lhzx
+        case 311: m = {false, 2, false, true, true}; return true;   // lhzux
+        case 343: m = {false, 2, true, false, true}; return true;   // lhax
+        case 407: m = {true, 2, false, false, true}; return true;   // sthx
+        case 439: m = {true, 2, false, true, true}; return true;    // sthux
+        default: return false;
+      }
+    default:
+      return false;
+  }
+}
+
+// Emits the fast path; branches that must take the slow path are appended to
+// `slow`. On success, falls through with the access done.
+void EmitMemFast(PPCEmitter& e, u32 inst, const MemOp& m, std::vector<u32>& slow) {
+  u32 rd = Field(inst, 21), ra = Field(inst, 16), rb = Field(inst, 11);
+  // ea -> r3
+  if (m.indexed) {
+    LoadGpr(e, 4, rb);
+    if (ra) {
+      LoadGpr(e, 3, ra);
+      e.add(3, 3, 4);
+    } else {
+      e.mr(3, 4);
+    }
+  } else {
+    s32 d = (s16)(inst & 0xFFFF);
+    if (ra) {
+      LoadGpr(e, 3, ra);
+      e.addi(3, 3, d);
+    } else {
+      e.li(3, d);
+    }
+  }
+  // Data translation must be on (MSR.DR)
+  e.lwz(0, OFF_MSR, R_CPU);
+  e.andi_(0, 0, MSR_DR);
+  slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+  // entry = dbat[ea >> 17]
+  e.rlwinm(4, 3, 15, 15, 29);  // (ea >> 17) * 4
+  e.lwzx(5, R_DBAT, 4);
+  e.cmpwi(0, 5, 0);
+  slow.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+  // pa = block base | (ea & 0x1FFFF); MEM1 only (pa < 24 MiB: pa >> 23 < 3)
+  e.rlwimi(5, 3, 0, 15, 31);
+  e.rlwinm(7, 5, 9, 23, 31);  // pa >> 23
+  e.cmplwi(0, 7, 3);
+  slow.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_LT));
+  if (m.store) {
+    LoadGpr(e, 6, rd);
+    u32 xo = m.size == 4 ? 151 : (m.size == 2 ? 407 : 215);  // stwx, sthx, stbx
+    e.Emit(PPCEmitter::X(31, 6, R_MEM1, 5, xo));
+    // write tracking: page_stamp[pa >> 12] = g_write_stamp
+    e.LoadImm(8, Addr(&Mem::g_write_stamp));
+    e.lwz(8, 0, 8);
+    e.rlwinm(9, 5, 22, 10, 29);  // (pa >> 12) * 4
+    e.stwx(8, R_STAMP, 9);
+  } else {
+    u32 xo = m.size == 4 ? 23 : (m.size == 2 ? (m.sign ? 343 : 279) : 87);  // lwzx, lhax/lhzx, lbzx
+    e.Emit(PPCEmitter::X(31, 6, R_MEM1, 5, xo));
+    StoreGpr(e, 6, rd);
+  }
+  if (m.update) StoreGpr(e, 3, ra);
+}
+
 }  // namespace
 
 bool Enabled() { return s_enabled; }
@@ -400,18 +510,47 @@ BlockFn Compile(const u32* insts, const Interpreter::OpFn* fns, u32 count) {
   e.stwu(1, -FRAME, 1);
   e.mflr(0);
   e.stw(0, FRAME + 4, 1);
-  e.stw(27, 12, 1);
-  e.stw(28, 16, 1);
-  e.stw(29, 20, 1);
-  e.stw(30, 24, 1);
-  e.stw(31, 28, 1);
+  for (u32 r = 24; r <= 31; r++) e.stw(r, 16 + (s32)(r - 24) * 4, 1);
   e.LoadImm(R_CPU, Addr(&cpu));
+  e.LoadImm(R_MEM1, Addr(Mem::g_mem1));
+  e.LoadImm(R_DBAT, Addr(Mem::DataBatTable()));
+  e.LoadImm(R_STAMP, Addr(Mem::g_page_stamp));
   e.lwz(R_PC, OFF_PC, R_CPU);
   e.li(R_PENDING, 0);
   bl(s_budget);
 
   bool last_inline = false;
   for (u32 k = 0; k < count; k++) {
+    MemOp m;
+    u32 ra = Field(insts[k], 16), rd = Field(insts[k], 21);
+    if (s_inline_enabled && DecodeMemOp(insts[k], m) && !(m.update && (ra == 0 || (!m.store && ra == rd)))) {
+      std::vector<u32> slow;
+      EmitMemFast(e, insts[k], m, slow);
+      // fast path done: inline bookkeeping
+      e.addi(R_PC, R_PC, 4);
+      e.addi(R_PENDING, R_PENDING, 1);
+      e.Emit(PPCEmitter::D(13, R_BUDGET, R_BUDGET, -1));  // addic. r30, r30, -1
+      if (k + 1 < count) exhaust.push_back(e.bc_forward(PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+      u32 to_next = e.b_forward();
+      // slow path: the interpreter
+      u32 slow_at = e.Here();
+      for (u32 at : slow) e.PatchBranchTo(at, slow_at);
+      bl(s_flush);
+      e.LoadImm(3, insts[k]);
+      e.CallAbs(Addr((const void*)fns[k]));
+      bl(s_post);
+      if (k + 1 < count) {
+        leave.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_EQ));
+        e.PatchBranchTo(to_next, e.Here());
+      } else {
+        // last instruction: the slow path leaves with the state published,
+        // the fast path joins the flushing exit
+        leave.push_back(e.b_forward());
+        e.PatchBranchTo(to_next, e.Here());
+      }
+      last_inline = true;  // the fast path needs the final flush
+      continue;
+    }
     if (s_inline_enabled && EmitInline(e, insts[k])) {
       e.addi(R_PC, R_PC, 4);
       e.addi(R_PENDING, R_PENDING, 1);
@@ -440,11 +579,7 @@ BlockFn Compile(const u32* insts, const Interpreter::OpFn* fns, u32 count) {
   for (u32 at : leave) e.PatchBranchTo(at, epilogue);
   e.lwz(0, FRAME + 4, 1);
   e.mtlr(0);
-  e.lwz(27, 12, 1);
-  e.lwz(28, 16, 1);
-  e.lwz(29, 20, 1);
-  e.lwz(30, 24, 1);
-  e.lwz(31, 28, 1);
+  for (u32 r = 24; r <= 31; r++) e.lwz(r, 16 + (s32)(r - 24) * 4, 1);
   e.addi(1, 1, FRAME);
   e.blr();
 

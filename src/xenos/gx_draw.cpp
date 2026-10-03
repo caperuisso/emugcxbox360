@@ -586,7 +586,11 @@ void MakeRenderState(const Video::GpuDrawState& st, RenderState& rs) {
   rs.sc_left = st.sc_left, rs.sc_top = st.sc_top, rs.sc_right = st.sc_right, rs.sc_bottom = st.sc_bottom;
 }
 
+// GX evaluates attributes at pixel centres (x + 0.5) while Direct3D 9 style
+// rasterizers sample at integer coordinates: shift by half a pixel.
 inline void PutPosition(float* p, float x, float y, float z, float w) {
+  x -= 0.5f;
+  y -= 0.5f;
   float nx = x / (EFB_W * 0.5f) - 1.0f, ny = 1.0f - y / (EFB_H * 0.5f);
   p[0] = nx * w, p[1] = ny * w, p[2] = z * w, p[3] = w;
 }

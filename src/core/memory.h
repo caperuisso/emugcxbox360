@@ -24,6 +24,10 @@ void Clear();
 // Rebuild the 128 KiB block translation tables from the BAT SPRs.
 void UpdateBATs();
 
+// Data BAT translation table (one entry per 128 KiB block: physical base | 1,
+// or 0 when unmapped), used by the JIT's inline memory accesses.
+const u32* DataBatTable();
+
 // Effective-address accesses (data side). On a translation miss a DSI is raised.
 u8 Read8(u32 ea);
 u16 Read16(u32 ea);
