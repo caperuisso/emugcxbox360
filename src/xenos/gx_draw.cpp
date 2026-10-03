@@ -41,6 +41,11 @@ enum : u32 {
   C_FOG = 34,        // perspective: (A * 16777215, b_magnitude, 16777215 / 2^b_shift, C); ortho: (A, -, -, C)
   C_FOG_COLOR = 35,  // (r, g, b, 0)
   C_FOG_EXP = 36,    // (-8, 0, 0, 0)
+  C_IND_SCALE = 40,  // 4: indirect lookup scale per indirect stage (2^-ss / width, 2^-ts / height)
+  C_IND_BIAS = 44,   // 16: indirect coordinate bias per TEV stage (s, t, u)
+  C_IND_MTX = 60,    // 32: two rows per TEV stage (texels; .w = dynamic matrix factor)
+  C_IND_CONST = 92,  // (1/8, 1/16, 1/32, 256)
+  C_IND_WRAP = 93,   // 3: (1/N, N) pairs for N = 256, 128, 64, 32, 16
 };
 static_assert(C_FOG_EXP < NUM_PS_CONSTS, "constant layout");
 
@@ -77,6 +82,9 @@ struct StageInfo {
 struct DrawInfo {
   u32 num_stages;  // number of TEV stages (1..16)
   u32 num_texgens, num_chans;
+  u32 num_ind;
+  u32 ind_map[4], ind_coord[4];
+  u32 ind_cmd[16];
   StageInfo stage[16];
   u32 alpha_cmp;   // BP alpha compare without the reference values
   u32 fog_sel;
@@ -112,6 +120,15 @@ void Decode(const Video::GpuDrawState& st, DrawInfo& d) {
     memcpy(c.tex_swap, swap[Bits(c.ac, 2, 2)], sizeof(c.tex_swap));
     memcpy(c.ras_swap, swap[Bits(c.ac, 0, 2)], sizeof(c.ras_swap));
   }
+  d.num_ind = Bits(genmode, 16, 3);
+  u32 iref = bp[Video::BP_IREF];
+  for (u32 i = 0; i < 4; i++) {
+    d.ind_map[i] = Bits(iref, i * 6, 3);
+    d.ind_coord[i] = Bits(iref, i * 6 + 3, 3);
+    if (d.ind_coord[i] >= d.num_texgens) d.ind_coord[i] = 0;
+  }
+  for (u32 st = 0; st < d.num_stages; st++)
+    d.ind_cmd[st] = (st < 16 && d.num_texgens > 0) ? (bp[Video::BP_IND_CMD + st] & 0x1FFFFF) : 0;
   d.alpha_cmp = bp[Video::BP_ALPHA_COMPARE] & 0xFF0000;
   u32 fog3 = bp[Video::BP_FOG3];
   d.fog_sel = Bits(fog3, 21, 3);
@@ -159,6 +176,8 @@ ShaderEntry* GetVertexShader(u32 texgens, bool fog) {
 struct PsRegs {
   u32 interps;
   u32 reg[4], tex, ras, a, b, c, d, x, y, out;
+  u32 ind[4];  // indirect lookups (byte values)
+  u32 tc, ic;  // texture coordinates of the stage (texels), indirect coordinates / bump
 };
 
 Src ColorArg(const PsRegs& r, u32 stage, u32 arg) {
@@ -277,6 +296,8 @@ ShaderEntry* GetPixelShader(const DrawInfo& d) {
   keyw.push_back(d.num_stages | (d.num_texgens << 8) | (d.num_chans << 12) | (d.fog_sel << 16) |
                  ((d.fog_ortho ? 1u : 0u) << 20));
   keyw.push_back(d.alpha_cmp);
+  keyw.push_back(d.num_ind);
+  for (u32 i = 0; i < d.num_ind; i++) keyw.push_back(d.ind_map[i] | (d.ind_coord[i] << 3));
   for (u32 s = 0; s < d.num_stages; s++) {
     const StageInfo& c = d.stage[s];
     keyw.push_back(c.cc);
@@ -284,6 +305,7 @@ ShaderEntry* GetPixelShader(const DrawInfo& d) {
     keyw.push_back(c.texmap | (c.texcoord << 3) | ((c.tex_enable ? 1u : 0u) << 6) | (c.ras_chan << 7) |
                    (c.tex_swap[0] << 10) | (c.tex_swap[1] << 12) | (c.tex_swap[2] << 14) | (c.tex_swap[3] << 16) |
                    (c.ras_swap[0] << 18) | (c.ras_swap[1] << 20) | (c.ras_swap[2] << 22) | (c.ras_swap[3] << 24));
+    keyw.push_back(d.ind_cmd[s] & ~(0x7u << 4));  // the bias selection is a constant
   }
   std::string key = KeyOf(keyw);
   auto it = s_ps_cache->find(key);
@@ -294,19 +316,105 @@ ShaderEntry* GetPixelShader(const DrawInfo& d) {
   u32 t = r.interps;
   for (int i = 0; i < 4; i++) r.reg[i] = t++;
   r.tex = t++, r.ras = t++, r.a = t++, r.b = t++, r.c = t++, r.d = t++, r.x = t++, r.y = t++, r.out = t++;
+  for (u32 i = 0; i < 4; i++) r.ind[i] = (i < d.num_ind) ? t++ : 0;
+  r.tc = t++, r.ic = t++;
 
   ShaderBuilder b(true);
   b.UseTemps(t);
   for (int i = 0; i < 4; i++) b.Mov(r.reg[i], 0xF, Src::C(C_TEV_REGS + i));
 
+  // Indirect texture lookups, kept as byte values 0..255
+  for (u32 i = 0; i < d.num_ind; i++) {
+    u32 tc = 2 + d.ind_coord[i];
+    b.Scalar(S_RCP, r.x, 0x1, Src::R(tc, SWZ_ZZZZ));
+    b.Vec(V_MUL, r.y, 0x3, Src::R(tc), Src::R(r.x, SWZ_XXXX));
+    b.Vec(V_MUL, r.y, 0x3, Src::R(r.y), Src::C(C_IND_SCALE + i));
+    b.TFetch2D(r.ind[i], r.y, d.ind_map[i]);
+    b.Vec(V_MAD, r.ind[i], 0xF, Src::R(r.ind[i]), Src::C(C_MISC, SWZ_WWWW), Src::C(C_MISC, SWZ_ZZZZ));
+    b.Vec(V_FLOOR, r.ind[i], 0xF, Src::R(r.ind[i]));
+  }
+
   for (u32 s = 0; s < d.num_stages; s++) {
     const StageInfo& c = d.stage[s];
-    // Texture
-    if (c.tex_enable && d.num_texgens > 0) {
+    // Texture coordinates of the stage (texels), possibly perturbed by an
+    // indirect lookup
+    u32 ind = d.ind_cmd[s];
+    bool bump = false;
+    if (d.num_texgens > 0 && (c.tex_enable || ind)) {
       u32 tc = 2 + c.texcoord;
       b.Scalar(S_RCP, r.x, 0x1, Src::R(tc, SWZ_ZZZZ));                        // 1 / q
       b.Vec(V_MUL, r.y, 0x3, Src::R(tc), Src::R(r.x, SWZ_XXXX));              // s/q, t/q (texels)
-      b.Vec(V_MUL, r.y, 0x3, Src::R(r.y), Src::C(C_TEX_SCALE + c.texmap));    // normalized
+      if (!ind) {
+        b.Mov(r.tc, 0x3, Src::R(r.y));
+      } else {
+        u32 bt = Bits(ind, 0, 2), fmt = Bits(ind, 2, 2), bs = Bits(ind, 7, 2);
+        u32 mtx_index = Bits(ind, 9, 2), mtx_id = Bits(ind, 11, 2);
+        u32 src = bt < d.num_ind ? r.ind[bt] : r.ind[0];
+        if (!d.num_ind) src = r.y;  // no indirect stage: undefined, avoid garbage
+        // ic.xyz = (A, B, G) >> shift + bias
+        static const u32 kShiftSwz[4] = {0, SWZ_XXXX, SWZ_YYYY, SWZ_ZZZZ};
+        if (fmt == 0) {
+          b.Mov(r.ic, 0x7, Src::R(src, Swz(3, 2, 1, 1)));
+        } else {
+          b.Vec(V_MUL, r.ic, 0x7, Src::R(src, Swz(3, 2, 1, 1)), Src::C(C_IND_CONST, kShiftSwz[fmt]));
+          b.Vec(V_FLOOR, r.ic, 0x7, Src::R(r.ic));
+        }
+        b.Vec(V_ADD, r.ic, 0x7, Src::R(r.ic), Src::C(C_IND_BIAS + s));
+        // Alpha bump (ic.w) for the rasterized color selections 5/6
+        if (bs) {
+          static const u32 kBumpSwz[4] = {0, SWZ_WWWW, SWZ_ZZZZ, SWZ_YYYY};
+          Src raw = Src::R(src, kBumpSwz[bs]);
+          if (fmt == 0) {  // & 0xF8
+            b.Vec(V_MUL, r.ic, 0x8, raw, Src::C(C_IND_CONST, SWZ_XXXX));
+            b.Vec(V_FLOOR, r.ic, 0x8, Src::R(r.ic));
+            b.Vec(V_MUL, r.ic, 0x8, Src::R(r.ic), Src::C(C_SCALE, SWZ_ZZZZ));  // * 4
+            b.Vec(V_ADD, r.ic, 0x8, Src::R(r.ic), Src::R(r.ic));               // * 8
+          } else {         // (raw << k) & 0xFF = frac(raw / 2^(8-k)) * 256
+            static const u32 kFracSwz[4] = {0, SWZ_XXXX, SWZ_YYYY, SWZ_ZZZZ};  // 1/8, 1/16, 1/32
+            b.Vec(V_MUL, r.ic, 0x8, raw, Src::C(C_IND_CONST, kFracSwz[fmt]));
+            b.Vec(V_FRC, r.ic, 0x8, Src::R(r.ic));
+            b.Vec(V_MUL, r.ic, 0x8, Src::R(r.ic), Src::C(C_IND_CONST, SWZ_WWWW));
+          }
+          bump = true;
+        }
+        // Wrapped coordinates (x = s, y = t)
+        u32 wrap[2] = {Bits(ind, 13, 3), Bits(ind, 16, 3)};
+        for (u32 k = 0; k < 2; k++) {
+          u32 m = 1u << k;
+          Src comp = Src::R(r.y, k ? SWZ_YYYY : SWZ_XXXX);
+          if (wrap[k] == 0) {
+            b.Mov(r.x, m, comp);
+          } else if (wrap[k] >= 6) {
+            b.Mov(r.x, m, Src::C(C_MISC, SWZ_XXXX));
+          } else {
+            // s mod N, N = 256 >> (mode - 1): frac(s / N) * N
+            u32 idx = wrap[k] - 1, cst = C_IND_WRAP + idx / 2;
+            b.Vec(V_MUL, r.x, m, comp, Src::C(cst, idx % 2 ? SWZ_ZZZZ : SWZ_XXXX));
+            b.Vec(V_FRC, r.x, m, Src::R(r.x));
+            b.Vec(V_MUL, r.x, m, Src::R(r.x), Src::C(cst, idx % 2 ? SWZ_WWWW : SWZ_YYYY));
+          }
+        }
+        // Offset from the indirect matrix
+        if (mtx_index) {
+          if (mtx_id == 0) {
+            b.Vec(V_DP3, r.out, 0x1, Src::R(r.ic), Src::C(C_IND_MTX + 2 * s));
+            b.Vec(V_DP3, r.out, 0x2, Src::R(r.ic), Src::C(C_IND_MTX + 2 * s + 1));
+          } else {
+            Src cmp = Src::R(r.ic, mtx_id == 1 ? SWZ_XXXX : SWZ_YYYY);
+            b.Vec(V_MUL, r.out, 0x3, Src::R(r.y), cmp);
+            b.Vec(V_MUL, r.out, 0x3, Src::R(r.out), Src::C(C_IND_MTX + 2 * s, SWZ_WWWW));
+          }
+          b.Vec(V_ADD, r.x, 0x3, Src::R(r.x), Src::R(r.out));
+        }
+        if (Bits(ind, 20, 1))
+          b.Vec(V_ADD, r.tc, 0x3, Src::R(r.tc), Src::R(r.x));
+        else
+          b.Mov(r.tc, 0x3, Src::R(r.x));
+      }
+    }
+    // Texture
+    if (c.tex_enable && d.num_texgens > 0) {
+      b.Vec(V_MUL, r.y, 0x3, Src::R(r.tc), Src::C(C_TEX_SCALE + c.texmap));  // normalized
       b.TFetch2D(r.tex, r.y, c.texmap);
       u32 sw = Swz(c.tex_swap[0], c.tex_swap[1], c.tex_swap[2], c.tex_swap[3]);
       if (sw != SWZ_XYZW) b.Mov(r.tex, 0xF, Src::R(r.tex, sw));
@@ -314,10 +422,23 @@ ShaderEntry* GetPixelShader(const DrawInfo& d) {
       b.Mov(r.tex, 0xF, Src::C(C_MISC, SWZ_XXXX));
     }
     // Rasterized color
-    if (c.ras_chan <= 1)
+    if (c.ras_chan <= 1) {
       b.Mov(r.ras, 0xF, Src::R(c.ras_chan, Swz(c.ras_swap[0], c.ras_swap[1], c.ras_swap[2], c.ras_swap[3])));
-    else
-      b.Mov(r.ras, 0xF, Src::C(C_MISC, SWZ_XXXX));  // alpha bump (indirect texturing) not supported yet
+    } else if ((c.ras_chan == 5 || c.ras_chan == 6) && bump) {
+      // alpha bump / 255 (selection 6 also ORs the top bits in: ab | ab >> 5)
+      if (c.ras_chan == 6) {
+        b.Vec(V_MUL, r.ras, 0x1, Src::R(r.ic, SWZ_WWWW), Src::C(C_IND_CONST, SWZ_ZZZZ));  // / 32
+        b.Vec(V_FLOOR, r.ras, 0x1, Src::R(r.ras));
+        b.Vec(V_ADD, r.ras, 0x1, Src::R(r.ras), Src::R(r.ic, SWZ_WWWW));
+        b.Mov(r.ras, 0xF, Src::R(r.ras, SWZ_XXXX));
+      } else {
+        b.Mov(r.ras, 0xF, Src::R(r.ic, SWZ_WWWW));
+      }
+      b.Scalar(S_RCP, r.x, 0x1, Src::C(C_MISC, SWZ_WWWW));  // 1/255
+      b.Vec(V_MUL, r.ras, 0xF, Src::R(r.ras), Src::R(r.x, SWZ_XXXX));
+    } else {
+      b.Mov(r.ras, 0xF, Src::C(C_MISC, SWZ_XXXX));
+    }
 
     u32 c_a = Bits(c.cc, 12, 4), c_b = Bits(c.cc, 8, 4), c_c = Bits(c.cc, 4, 4), c_d = Bits(c.cc, 0, 4);
     u32 a_a = Bits(c.ac, 13, 3), a_b = Bits(c.ac, 10, 3), a_c = Bits(c.ac, 7, 3), a_d = Bits(c.ac, 4, 3);
@@ -495,6 +616,43 @@ void Prepare(const Video::GpuDrawState& st, const Video::GpuVertex* v, u32 count
   out.tex_mask = 0;
   for (u32 s = 0; s < d.num_stages; s++)
     if (d.stage[s].tex_enable && d.num_texgens > 0) out.tex_mask |= 1u << d.stage[s].texmap;
+  if (d.num_texgens > 0)
+    for (u32 i = 0; i < d.num_ind; i++) out.tex_mask |= 1u << d.ind_map[i];
+
+  // Indirect texturing
+  for (u32 i = 0; i < d.num_ind; i++) {
+    u32 scale = st.bp[Video::BP_RAS1_SS0 + (i >> 1)];
+    u32 ss = Bits(scale, (i & 1) * 8, 4), ts = Bits(scale, (i & 1) * 8 + 4, 4);
+    const Video::GpuTexture& tx = st.tex[d.ind_map[i]];
+    c[C_IND_SCALE + i][0] = tx.width ? 1.0f / ((float)(1u << ss) * tx.width) : 0.0f;
+    c[C_IND_SCALE + i][1] = tx.height ? 1.0f / ((float)(1u << ts) * tx.height) : 0.0f;
+  }
+  for (u32 s = 0; s < d.num_stages; s++) {
+    u32 ind = d.ind_cmd[s];
+    if (!ind) continue;
+    float bias = Bits(ind, 2, 2) == 0 ? -128.0f : 1.0f;
+    for (u32 k = 0; k < 3; k++) c[C_IND_BIAS + s][k] = Bits(ind, 4 + k, 1) ? bias : 0.0f;
+    u32 mtx_index = Bits(ind, 9, 2);
+    if (mtx_index) {
+      u32 base = Video::BP_IND_MTX + (mtx_index - 1) * 3;
+      u32 m0 = st.bp[base], m1 = st.bp[base + 1], m2 = st.bp[base + 2];
+      auto s11 = [](u32 v) { return (float)((s32)(v << 21) >> 21); };
+      int field = (int)(Bits(m0, 22, 2) | (Bits(m1, 22, 2) << 2) | (Bits(m2, 22, 1) << 4));
+      float f = std::ldexp(1.0f, field - 17);
+      float* r0 = c[C_IND_MTX + 2 * s];
+      float* r1 = c[C_IND_MTX + 2 * s + 1];
+      r0[0] = s11(m0 & 0x7FF) * f / 1024.0f, r0[1] = s11(m1 & 0x7FF) * f / 1024.0f, r0[2] = s11(m2 & 0x7FF) * f / 1024.0f;
+      r1[0] = s11((m0 >> 11) & 0x7FF) * f / 1024.0f, r1[1] = s11((m1 >> 11) & 0x7FF) * f / 1024.0f;
+      r1[2] = s11((m2 >> 11) & 0x7FF) * f / 1024.0f;
+      r0[3] = f / 256.0f;  // dynamic matrices: s * coord / 256
+    }
+  }
+  c[C_IND_CONST][0] = 1.0f / 8, c[C_IND_CONST][1] = 1.0f / 16, c[C_IND_CONST][2] = 1.0f / 32, c[C_IND_CONST][3] = 256;
+  const float wraps[5] = {256, 128, 64, 32, 16};
+  for (int k = 0; k < 5; k++) {
+    c[C_IND_WRAP + k / 2][(k % 2) * 2] = 1.0f / wraps[k];
+    c[C_IND_WRAP + k / 2][(k % 2) * 2 + 1] = wraps[k];
+  }
   for (u32 t = 0; t < 8; t++) {
     const Video::GpuTexture& tx = st.tex[t];
     c[C_TEX_SCALE + t][0] = tx.width ? 1.0f / tx.width : 0.0f;

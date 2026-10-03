@@ -36,7 +36,7 @@ struct ShaderEntry {
   void* backend_object = nullptr;  // owned by the backend (GPU copy of the code)
 };
 
-constexpr int NUM_PS_CONSTS = 40;
+constexpr int NUM_PS_CONSTS = 96;
 
 struct PreparedDraw {
   ShaderEntry* vs;
