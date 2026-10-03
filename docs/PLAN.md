@@ -23,10 +23,14 @@ the PC (reference images, qemu-ppc big-endian runs) before going to the console.
 - [x] v3-v6: inline loads/stores with a RAM fast path, FP arithmetic, psq_l/psq_st (float GQR)
 - [x] v7-v8: carries, CR moves, FP moves/merges/compares, mtlr/mtctr (no block split)
 - [x] v9: generated dispatcher chaining blocks
+- [x] v10-v14: GPR, CR and FPR caching in host registers, block linking, more instructions inline
+      (98%+ of executed instructions native)
 - Each version verified bit-identical to the interpreter over 300 WW fields under qemu-ppc.
-- [ ] Guest register caching across instructions (currently loaded/stored per instruction)
 - [ ] Quantized psq types (u8/s16 with scale), remaining interpreted instructions
 
 ## Other
+- [ ] Save states are host-endian (a PC state does not load on the 360 / PPC build)
+- [x] VI line event only on interesting lines; 200k-cycle slices (identical output)
+- [x] On-screen profiler (C/G/A/V shares) for hardware measurements
 - [ ] Audio/DSP and frame pacing costs on the console
 - [ ] Measure on hardware: FPS with JIT on/off (Start), GPU rendering on/off (B)
