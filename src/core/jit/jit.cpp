@@ -368,6 +368,78 @@ bool EmitInline(PPCEmitter& e, u32 inst) {
 
 bool s_inline_enabled = true;
 
+// Branches (always the last instruction of a block). On return r28 holds the
+// next pc. The forms that the interpreter uses for idle-loop detection
+// ("b ." and bc -8) are left to the interpreter.
+bool EmitBranch(PPCEmitter& e, u32 inst) {
+  u32 op = inst >> 26;
+  bool lk = inst & 1, aa = inst & 2;
+  constexpr s32 OFF_LR = OFF_SPR + SPR_LR * 4, OFF_CTR = OFF_SPR + SPR_CTR * 4;
+  if (op == 18) {
+    s32 li = (s32)((inst & 0x03FFFFFC) << 6) >> 6;
+    if (!aa && li == 0 && !lk) return false;
+    if (lk) {
+      e.addi(4, R_PC, 4);
+      e.stw(4, OFF_LR, R_CPU);
+    }
+    if (aa) {
+      e.LoadImm(R_PC, (u32)li);
+    } else {
+      e.LoadImm(4, (u32)li);
+      e.add(R_PC, R_PC, 4);
+    }
+    return true;
+  }
+  u32 xo = (inst >> 1) & 0x3FF;
+  bool is_bc = op == 16, is_lr = op == 19 && xo == 16, is_ctr = op == 19 && xo == 528;
+  if (!is_bc && !is_lr && !is_ctr) return false;
+  u32 bo = Field(inst, 21), bi = Field(inst, 16);
+  s32 bd = (s16)(inst & 0xFFFC);
+  if (is_bc && bd == -8) return false;
+  std::vector<u32> fail;
+  // target -> r7 (read LR / CTR before they are updated)
+  if (is_lr) {
+    e.lwz(7, OFF_LR, R_CPU);
+    e.rlwinm(7, 7, 0, 0, 29);
+  }
+  if (!is_ctr && !(bo & 4)) {
+    e.lwz(6, OFF_CTR, R_CPU);
+    e.addi(6, 6, -1);
+    e.stw(6, OFF_CTR, R_CPU);
+    e.cmpwi(0, 6, 0);
+    // ctr_ok = (CTR != 0) ^ bo[1]
+    fail.push_back(e.bc_forward((bo & 2) ? PPCEmitter::BO_FALSE : PPCEmitter::BO_TRUE, PPCEmitter::CR0_EQ));
+  }
+  if (!(bo & 16)) {
+    e.lwz(6, OFF_CR, R_CPU);
+    e.rlwinm(6, 6, (bi + 1) & 31, 31, 31);
+    e.cmpwi(0, 6, (s32)((bo >> 3) & 1));
+    fail.push_back(e.bc_forward(PPCEmitter::BO_FALSE, PPCEmitter::CR0_EQ));
+  }
+  // taken
+  if (is_bc) {
+    if (aa) {
+      e.LoadImm(7, (u32)bd);
+    } else {
+      e.addi(7, R_PC, bd);
+    }
+  } else if (is_ctr) {
+    e.lwz(7, OFF_CTR, R_CPU);
+    e.rlwinm(7, 7, 0, 0, 29);
+  }
+  u32 done = e.b_forward();
+  u32 fail_at = e.Here();
+  for (u32 f : fail) e.PatchBranchTo(f, fail_at);
+  e.addi(7, R_PC, 4);
+  e.PatchBranchTo(done, e.Here());
+  if (lk) {
+    e.addi(4, R_PC, 4);
+    e.stw(4, OFF_LR, R_CPU);
+  }
+  e.mr(R_PC, 7);
+  return true;
+}
+
 // Load/store with a fast path for guest RAM. Returns false when the
 // instruction is not a supported load/store. Emits:
 //   fast path (translated address in MEM1)  -> inline bookkeeping, b next
@@ -605,6 +677,11 @@ BlockFn Compile(const u32* insts, const Interpreter::OpFn* fns, u32 count) {
       }
       last_inline = true;  // the fast path needs the final flush
       continue;
+    }
+    if (s_inline_enabled && k + 1 == count && EmitBranch(e, insts[k])) {
+      e.addi(R_PENDING, R_PENDING, 1);
+      last_inline = true;  // flush (pc = r28) and leave
+      break;
     }
     if (s_inline_enabled && EmitInline(e, insts[k])) {
       e.addi(R_PC, R_PC, 4);
